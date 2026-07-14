@@ -483,6 +483,15 @@ async fn status_command(
                         .collect::<Vec<_>>()
                         .join(" ");
                 }
+            } else if user.api_type() == ApiType::Listenbrainz {
+                user_playcount = api_requester::fetch_listenbrainz_track_playcount(
+                    user.account_username.as_str(),
+                    tracks[0].artist.as_str(),
+                    tracks[0].name.as_str(),
+                    tracks[0].recording_mbid.as_deref(),
+                )
+                .await
+                .unwrap_or_default();
             }
 
             let mut first_track_info = if user_playcount > 0 {

@@ -23,6 +23,7 @@ pub struct Track {
     pub user_loved: bool,
     pub now_playing: bool,
     pub tags: Option<Vec<String>>,
+    pub recording_mbid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -317,7 +318,40 @@ pub async fn fetch_lastfm_track(
         date: None,
         now_playing: false,
         tags,
+        recording_mbid: None,
     })
+}
+
+pub async fn fetch_listenbrainz_track_playcount(
+    username: &str,
+    artist: &str,
+    track: &str,
+    recording_mbid: Option<&str>,
+) -> Result<u64, Box<dyn Error + Send + Sync>> {
+    let base_url = get_base_url(&ApiType::Listenbrainz);
+    let url = format!("{base_url}stats/user/{username}/recordings?range=all_time&count=1000");
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    let user_playcount = json["payload"]["recordings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|recording| {
+            // ListenBrainz formats the artist credit differently between the live listen and
+            // the stats endpoint (e.g. "Gmtn., kozato, Luze" vs "gmtn. vs. kozato (fw. LUZE)"),
+            // so match on recording_mbid when we have it and only fall back to name matching.
+            if let Some(recording_mbid) = recording_mbid {
+                recording["recording_mbid"].as_str() == Some(recording_mbid)
+            } else {
+                recording["artist_name"].as_str().unwrap_or_default().eq_ignore_ascii_case(artist)
+                    && recording["track_name"].as_str().unwrap_or_default().eq_ignore_ascii_case(track)
+            }
+        })
+        .and_then(|recording| recording["listen_count"].as_u64())
+        .unwrap_or_default();
+
+    Ok(user_playcount)
 }
 
 pub async fn fetch_lastfm_album(
@@ -479,9 +513,17 @@ pub fn parse_listenbrainz_tracks_np(
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            let album_art_url = track_metadata["release_mbid"]
+            let album_art_url = track_metadata["mbid_mapping"]["caa_release_mbid"]
                 .as_str()
-                .map(|mbid| format!("https://coverartarchive.org/release/{mbid}/front-250"));
+                .or_else(|| track_metadata["mbid_mapping"]["release_mbid"].as_str())
+                .or_else(|| track_metadata["additional_info"]["release_mbid"].as_str())
+                .or_else(|| track_metadata["release_mbid"].as_str())
+                .map(|mbid| format!("https://coverartarchive.org/release/{mbid}/front-500"));
+            let recording_mbid = track_metadata["mbid_mapping"]["recording_mbid"]
+                .as_str()
+                .or_else(|| track_metadata["additional_info"]["recording_mbid"].as_str())
+                .or_else(|| track_metadata["recording_mbid"].as_str())
+                .map(|s| s.to_string());
             let user_playcount = track_metadata["listen_count"].as_u64().unwrap_or_default();
             let date = track_json["listened_at"].as_u64();
 
@@ -498,6 +540,7 @@ pub fn parse_listenbrainz_tracks_np(
                 user_playcount,
                 now_playing,
                 tags: None,
+                recording_mbid,
             }
         })
         .collect::<Vec<_>>();
@@ -556,6 +599,7 @@ pub fn parse_lastfm_tracks(json_arr: &Value) -> Result<Vec<Track>, Box<dyn Error
                 user_playcount: 0,
                 now_playing,
                 tags: None,
+                recording_mbid: None,
             }
         })
         .collect::<Vec<_>>();
@@ -973,6 +1017,7 @@ pub async fn fetch_tracks(
                         now_playing: false,
                         user_loved: false,
                         tags: None,
+                        recording_mbid: None,
                     }
                 })
                 .collect::<Vec<_>>();
