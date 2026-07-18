@@ -98,7 +98,13 @@ static COMMAND_USAGE_MAP: LazyLock<HashMap<String, &str>> = LazyLock::new(|| {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    pretty_env_logger::init_timed();
+    // pretty_env_logger's default filter is `Off` when RUST_LOG isn't set, so nothing
+    // (not even errors) gets logged out of the box. Default to `info` instead, still
+    // overridable via RUST_LOG.
+    pretty_env_logger::formatted_timed_builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_env("RUST_LOG")
+        .init();
 
     let bot = teloxide::Bot::new(config::BOT_TOKEN).throttle(Limits {
         messages_per_sec_chat: 1,
@@ -132,7 +138,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     bot.send_message(config::OWNER_ID.to_string(), consts::BOT_STARTED)
         .await?;
-    ME.set(bot.get_me().await?).unwrap();
+    let me = bot.get_me().await?;
+    log::info!("Starting as @{}", me.username());
+    ME.set(me).unwrap();
 
     let commands: Vec<BotCommand> = Command::bot_commands()
         .iter()
@@ -168,6 +176,12 @@ async fn message_handler(bot: Bot, msg: Message) -> Result<(), Box<dyn Error + S
         if from.is_none() {
             return Ok(());
         }
+
+        log::debug!(
+            "message from {} ({}): {text}",
+            from.unwrap().id.0,
+            from.unwrap().first_name
+        );
 
         if from.unwrap().is_anonymous() {
             utils::send_or_edit_message(&bot, consts::ANON_KUN, None, None, false, None, true)
@@ -377,6 +391,7 @@ async fn my_chat_member_handler(
     chat_member_updated: ChatMemberUpdated,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if chat_member_updated.new_chat_member.user.id == me.id {
+        log::info!("added to chat {}", chat_member_updated.chat.id);
         start_command(&bot, chat_member_updated.chat.id).await?;
     }
     Ok(())
@@ -1515,6 +1530,8 @@ async fn inline_query_handler(
     bot: Bot,
     q: InlineQuery,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    log::debug!("inline query from {}: {:?}", q.from.id.0, q.query);
+
     let user = DB.lock().unwrap().fetch_user(q.from.id.0);
 
     let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
@@ -1616,6 +1633,13 @@ async fn inline_result_handler(
         .collect::<Vec<_>>();
     let result_id = *splits.first().unwrap_or(&"");
     let from = Some(&chosen_inline_result.from);
+
+    log::debug!(
+        "chosen inline result from {}: {result_id}, inline_message_id={:?}",
+        chosen_inline_result.from.id.0,
+        chosen_inline_result.inline_message_id
+    );
+
     let user = get_registered_user(
         &bot,
         None,
@@ -1624,7 +1648,8 @@ async fn inline_result_handler(
         false,
     )
     .await;
-    if user.is_err() {
+    if let Err(e) = &user {
+        log::warn!("chosen inline result {result_id}: user lookup failed: {e}");
         return Ok(());
     }
 
@@ -1779,6 +1804,7 @@ async fn fetch_lastfm_infos(
 
 async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Error + Send + Sync>> {
     let callback_data = q.data.as_ref().unwrap();
+    log::debug!("callback from {}: {callback_data}", q.from.id.0);
     let splits: Vec<&str> = callback_data.splitn(3, ' ').collect();
     let allowed_user_id: u64 = splits[0].parse()?;
     let data = splits[1];

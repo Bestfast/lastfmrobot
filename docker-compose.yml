@@ -1,0 +1,8 @@
+services:
+  lastfmrobot:
+    build: .
+    image: lastfmrobot
+    restart: unless-stopped
+    volumes:
+      - ./NotoSerifCJK.ttc:/app/NotoSerifCJK.ttc:ro
+      - ./users.sqlite:/app/users.sqlite
