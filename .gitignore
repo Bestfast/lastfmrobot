@@ -9,3 +9,7 @@
 *.ttf
 *.otf
 Cargo.lock
+# sqlite3 import libs and dll produced when linking rusqlite on Windows
+sqlite3.dll
+*.exp
+*.lib
