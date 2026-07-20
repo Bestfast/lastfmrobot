@@ -1,4 +1,4 @@
-use std::{error::Error, sync::LazyLock, time::Duration};
+use std::{error::Error, future::Future, sync::LazyLock, time::Duration};
 
 use http::Extensions;
 use http_cache_reqwest::{Cache, CacheMode, CacheOptions, HttpCache, MokaManager};
@@ -195,6 +195,30 @@ pub static CLIENT_NOCACHE: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
     .with(Response200Middleware {})
     .build()
 });
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+// ListenBrainz goes down fairly often and its stats endpoints lag behind fresh listens.
+// When a ListenBrainz request fails or comes back with nothing usable, retry against
+// Last.fm, assuming the user has the same username on both platforms. Both arguments are
+// futures and so are lazy — the Last.fm request is only issued once it's awaited.
+//
+// Callers pass `None` as the Last.fm limit rather than forwarding their own: the limits
+// they choose are sized for ListenBrainz (which caps out far lower), so reusing them
+// would truncate the fallback for no reason.
+async fn or_lastfm<T>(
+    listenbrainz: impl Future<Output = Result<T, BoxError>>,
+    lastfm: impl Future<Output = Result<T, BoxError>>,
+    is_usable: impl FnOnce(&T) -> bool,
+) -> Result<T, BoxError> {
+    match listenbrainz.await {
+        Ok(value) if is_usable(&value) => Ok(value),
+        Ok(_) => lastfm.await,
+        // Surface the ListenBrainz error if the fallback fails too — that's the service
+        // the user actually configured, so its error is the one worth reporting.
+        Err(lb_err) => lastfm.await.map_err(|_| lb_err),
+    }
+}
 
 fn get_base_url(api_type: &ApiType) -> &'static str {
     match api_type {
@@ -607,14 +631,85 @@ pub fn parse_lastfm_tracks(json_arr: &Value) -> Result<Vec<Track>, Box<dyn Error
     Ok(tracks)
 }
 
+async fn fetch_recent_tracks_listenbrainz(
+    username: &str,
+    cache_control: &str,
+    actual_limit: usize,
+) -> Result<Vec<Track>, BoxError> {
+    let base_url = get_base_url(&ApiType::Listenbrainz);
+
+    let url = format!("{base_url}user/{username}/playing-now");
+    let response = CLIENT
+        .get(&url)
+        .header("cache-control", cache_control)
+        .send()
+        .await?;
+
+    let json = response.json::<serde_json::Value>().await?;
+
+    let mut all_tracks = parse_listenbrainz_tracks_np(&json["payload"]["listens"], true)?;
+
+    if !all_tracks.is_empty() && actual_limit == 1 {
+        return Ok(all_tracks);
+    }
+
+    let url = format!("{base_url}user/{username}/listens?count=3");
+    let response = CLIENT
+        .get(&url)
+        .header("cache-control", cache_control)
+        .send()
+        .await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    let tracks = parse_listenbrainz_tracks(&json["payload"]["listens"])?;
+
+    all_tracks.extend(tracks);
+    Ok(all_tracks)
+}
+
+async fn fetch_recent_tracks_lastfm(
+    username: &str,
+    api_type: &ApiType,
+    cache_control: &str,
+) -> Result<Vec<Track>, BoxError> {
+    let url = Url::parse_with_params(
+        get_base_url(api_type),
+        &[
+            ("method", "user.getrecenttracks"),
+            ("user", username),
+            ("extended", "1"),
+            ("limit", "3"),
+            ("api_key", config::LASTFM_API_KEY),
+            ("format", "json"),
+        ],
+    )?;
+
+    let response = CLIENT
+        .get(url)
+        .header("cache-control", cache_control)
+        .send()
+        .await?;
+
+    let json = response.json::<serde_json::Value>().await?;
+    let err = json["error"]
+        .as_object()
+        .map(|x| x["#text"].as_str().unwrap_or_default());
+    if let Some(err) = err
+        && !err.is_empty()
+    {
+        return Err(Box::from(err));
+    }
+
+    parse_lastfm_tracks(&json["recenttracks"]["track"])
+}
+
 // Get recent tracks for a given user
 pub async fn fetch_recent_tracks(
     username: &str,
     api_type: &ApiType,
     prefer_cached: bool,
     actual_limit: usize,
-) -> Result<Vec<Track>, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(api_type);
+) -> Result<Vec<Track>, BoxError> {
     let cache_control = if prefer_cached {
         "max-stale=300"
     } else {
@@ -622,108 +717,64 @@ pub async fn fetch_recent_tracks(
     };
 
     match api_type {
-        ApiType::Listenbrainz => {
-            let url = format!("{base_url}user/{username}/playing-now");
-            let response = CLIENT
-                .get(&url)
-                .header("cache-control", cache_control)
-                .send()
-                .await?;
-
-            let json = response.json::<serde_json::Value>().await?;
-
-            let mut all_tracks = parse_listenbrainz_tracks_np(&json["payload"]["listens"], true)?;
-
-            if !all_tracks.is_empty() && actual_limit == 1 {
-                return Ok(all_tracks);
-            }
-
-            let url = format!("{base_url}user/{username}/listens?count=3");
-            let response = CLIENT
-                .get(&url)
-                .header("cache-control", cache_control)
-                .send()
-                .await?;
-            let json = response.json::<serde_json::Value>().await?;
-
-            let tracks = parse_listenbrainz_tracks(&json["payload"]["listens"])?;
-
-            all_tracks.extend(tracks);
-            Ok(all_tracks)
-        }
+        ApiType::Listenbrainz => or_lastfm(
+            fetch_recent_tracks_listenbrainz(username, cache_control, actual_limit),
+            fetch_recent_tracks_lastfm(username, &ApiType::Lastfm, cache_control),
+            |tracks| !tracks.is_empty(),
+        )
+        .await,
 
         ApiType::Librefm | ApiType::Lastfm => {
-            let url = Url::parse_with_params(
-                base_url,
-                &[
-                    ("method", "user.getrecenttracks"),
-                    ("user", username),
-                    ("extended", "1"),
-                    ("limit", "3"),
-                    ("api_key", config::LASTFM_API_KEY),
-                    ("format", "json"),
-                ],
-            )?;
-
-            let response = CLIENT
-                .get(url)
-                .header("cache-control", cache_control)
-                .send()
-                .await?;
-
-            let json = response.json::<serde_json::Value>().await?;
-            let err = json["error"]
-                .as_object()
-                .map(|x| x["#text"].as_str().unwrap_or_default());
-            if let Some(err) = err
-                && !err.is_empty()
-            {
-                return Err(Box::from(err));
-            }
-
-            let tracks = parse_lastfm_tracks(&json["recenttracks"]["track"])?;
-
-            Ok(tracks)
+            fetch_recent_tracks_lastfm(username, api_type, cache_control).await
         }
     }
+}
+
+async fn fetch_loved_tracks_listenbrainz(username: &str) -> Result<Vec<Track>, BoxError> {
+    let base_url = get_base_url(&ApiType::Listenbrainz);
+    let url = format!("{base_url}user/{username}/get-feedback?metadata=true&count=5");
+
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    parse_listenbrainz_tracks(&json["feedback"])
+}
+
+async fn fetch_loved_tracks_lastfm(
+    username: &str,
+    api_type: &ApiType,
+) -> Result<Vec<Track>, BoxError> {
+    let url = Url::parse_with_params(
+        get_base_url(api_type),
+        &[
+            ("method", "user.getlovedtracks"),
+            ("user", username),
+            ("limit", "5"),
+            ("api_key", config::LASTFM_API_KEY),
+            ("format", "json"),
+        ],
+    )?;
+
+    let response = CLIENT.get(url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    parse_lastfm_tracks(&json["lovedtracks"]["track"])
 }
 
 // Get loved tracks for a given user
 pub async fn fetch_loved_tracks(
     username: &str,
     api_type: &ApiType,
-) -> Result<Vec<Track>, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(api_type);
-
+) -> Result<Vec<Track>, BoxError> {
     match api_type {
-        ApiType::Listenbrainz => {
-            let url = format!("{base_url}user/{username}/get-feedback?metadata=true&count=5");
+        ApiType::Listenbrainz => or_lastfm(
+            fetch_loved_tracks_listenbrainz(username),
+            fetch_loved_tracks_lastfm(username, &ApiType::Lastfm),
+            |tracks| !tracks.is_empty(),
+        )
+        .await,
 
-            let response = CLIENT.get(&url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let tracks = parse_listenbrainz_tracks(&json["feedback"])?;
-
-            Ok(tracks)
-        }
-
-        ApiType::Librefm | ApiType::Lastfm => {
-            let url = Url::parse_with_params(
-                base_url,
-                &[
-                    ("method", "user.getlovedtracks"),
-                    ("user", username),
-                    ("limit", "5"),
-                    ("api_key", config::LASTFM_API_KEY),
-                    ("format", "json"),
-                ],
-            )?;
-
-            let response = CLIENT.get(url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let tracks = parse_lastfm_tracks(&json["lovedtracks"]["track"])?;
-
-            Ok(tracks)
-        }
+        ApiType::Librefm | ApiType::Lastfm => fetch_loved_tracks_lastfm(username, api_type).await,
     }
 }
 
@@ -748,111 +799,217 @@ fn time_period_to_api_string<'a>(duration: &'a TimePeriod, api_type: &'a ApiType
     }
 }
 
+async fn fetch_albums_listenbrainz(
+    username: &str,
+    duration: &TimePeriod,
+    limit: Option<usize>,
+) -> Result<Vec<Album>, BoxError> {
+    let base_url = get_base_url(&ApiType::Listenbrainz);
+    let duration_str = time_period_to_api_string(duration, &ApiType::Listenbrainz);
+
+    let url = format!(
+        "{}stats/user/{}/releases?range={}&count={}",
+        base_url,
+        username,
+        duration_str,
+        limit.unwrap_or(100)
+    );
+    let response = CLIENT.get(&url).send().await?;
+
+    let json = response.json::<serde_json::Value>().await?;
+
+    let albums = json["payload"]["releases"]
+        .as_array()
+        .ok_or("Invalid JSON format: 'payload.releases' is not an array")
+        .into_iter()
+        .flatten()
+        .map(|album_json| {
+            let artist = album_json["artist_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let name = album_json["release_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let album_art_url = album_json["release_mbid"]
+                .as_str()
+                .map(|mbid| format!("https://coverartarchive.org/release/{mbid}/front-500"));
+            let user_playcount = album_json["listen_count"].as_u64().unwrap_or_default();
+
+            Album {
+                name,
+                artist,
+                album_art_url,
+                listeners: 0,
+                playcount: 0,
+                user_playcount,
+                tags: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(albums)
+}
+
+async fn fetch_albums_lastfm(
+    username: &str,
+    duration: &TimePeriod,
+    api_type: &ApiType,
+    limit: Option<usize>,
+) -> Result<Vec<Album>, BoxError> {
+    let url = Url::parse_with_params(
+        get_base_url(api_type),
+        &[
+            ("method", "user.gettopalbums"),
+            ("period", time_period_to_api_string(duration, api_type)),
+            ("user", username),
+            ("limit", &limit.unwrap_or(200).to_string()),
+            ("api_key", config::LASTFM_API_KEY),
+            ("format", "json"),
+        ],
+    )?;
+    let response = CLIENT.get(url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    let albums = json["topalbums"]["album"]
+        .as_array()
+        .ok_or("Invalid JSON format: 'topalbums.album' is not an array")
+        .into_iter()
+        .flatten()
+        .map(|album_json| {
+            let artist = album_json["artist"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let name = album_json["name"].as_str().unwrap_or_default().to_string();
+            let album_art_url = get_biggest_lastfm_image(album_json);
+            let user_playcount = album_json["playcount"]
+                .as_str()
+                .unwrap_or_default()
+                .parse::<u64>()
+                .unwrap_or_default();
+
+            Album {
+                name,
+                artist,
+                album_art_url,
+                listeners: 0,
+                playcount: 0,
+                user_playcount,
+                tags: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(albums)
+}
+
 // Get albums for a given user
 pub async fn fetch_albums(
     username: &str,
     duration: &TimePeriod,
     api_type: &ApiType,
     limit: Option<usize>,
-) -> Result<Vec<Album>, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(api_type);
-    let duration_str = time_period_to_api_string(duration, api_type);
-
+) -> Result<Vec<Album>, BoxError> {
     match api_type {
-        ApiType::Listenbrainz => {
-            let url = format!(
-                "{}stats/user/{}/releases?range={}&count={}",
-                base_url,
-                username,
-                duration_str,
-                limit.unwrap_or(100)
-            );
-            let response = CLIENT.get(&url).send().await?;
-
-            let json = response.json::<serde_json::Value>().await?;
-
-            let albums = json["payload"]["releases"]
-                .as_array()
-                .ok_or("Invalid JSON format: 'payload.releases' is not an array")
-                .into_iter()
-                .flatten()
-                .map(|album_json| {
-                    let artist = album_json["artist_name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = album_json["release_name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    let album_art_url = album_json["release_mbid"].as_str().map(|mbid| {
-                        format!("https://coverartarchive.org/release/{mbid}/front-500")
-                    });
-                    let user_playcount = album_json["listen_count"].as_u64().unwrap_or_default();
-
-                    Album {
-                        name,
-                        artist,
-                        album_art_url,
-                        listeners: 0,
-                        playcount: 0,
-                        user_playcount,
-                        tags: None,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            Ok(albums)
-        }
+        ApiType::Listenbrainz => or_lastfm(
+            fetch_albums_listenbrainz(username, duration, limit),
+            fetch_albums_lastfm(username, duration, &ApiType::Lastfm, None),
+            |albums| !albums.is_empty(),
+        )
+        .await,
 
         ApiType::Librefm | ApiType::Lastfm => {
-            let url = Url::parse_with_params(
-                base_url,
-                &[
-                    ("method", "user.gettopalbums"),
-                    ("period", duration_str),
-                    ("user", username),
-                    ("limit", &limit.unwrap_or(200).to_string()),
-                    ("api_key", config::LASTFM_API_KEY),
-                    ("format", "json"),
-                ],
-            )?;
-            let response = CLIENT.get(url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-
-            let albums = json["topalbums"]["album"]
-                .as_array()
-                .ok_or("Invalid JSON format: 'topalbums.album' is not an array")
-                .into_iter()
-                .flatten()
-                .map(|album_json| {
-                    let artist = album_json["artist"]["name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = album_json["name"].as_str().unwrap_or_default().to_string();
-                    let album_art_url = get_biggest_lastfm_image(album_json);
-                    let user_playcount = album_json["playcount"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .parse::<u64>()
-                        .unwrap_or_default();
-
-                    Album {
-                        name,
-                        artist,
-                        album_art_url,
-                        listeners: 0,
-                        playcount: 0,
-                        user_playcount,
-                        tags: None,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            Ok(albums)
+            fetch_albums_lastfm(username, duration, api_type, limit).await
         }
     }
+}
+
+async fn fetch_artists_listenbrainz(
+    username: &str,
+    duration: &TimePeriod,
+    limit: Option<usize>,
+) -> Result<Vec<Artist>, BoxError> {
+    let url = format!(
+        "{}stats/user/{}/artists?range={}&count={}",
+        get_base_url(&ApiType::Listenbrainz),
+        username,
+        time_period_to_api_string(duration, &ApiType::Listenbrainz),
+        limit.unwrap_or(100)
+    );
+    let response = CLIENT.get(&url).send().await?;
+
+    let json = response.json::<serde_json::Value>().await?;
+
+    let artists = json["payload"]["artists"]
+        .as_array()
+        .ok_or("Invalid JSON format: 'payload.artists' is not an array")
+        .into_iter()
+        .flatten()
+        .map(|artists_json| {
+            let name = artists_json["artist_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let user_playcount = artists_json["listen_count"].as_u64().unwrap_or_default();
+
+            Artist {
+                name,
+                listeners: 0,
+                playcount: 0,
+                user_playcount,
+                tags: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(artists)
+}
+
+async fn fetch_artists_lastfm(
+    username: &str,
+    duration: &TimePeriod,
+    api_type: &ApiType,
+    limit: Option<usize>,
+) -> Result<Vec<Artist>, BoxError> {
+    let url = Url::parse_with_params(
+        get_base_url(api_type),
+        &[
+            ("method", "user.gettopartists"),
+            ("period", time_period_to_api_string(duration, api_type)),
+            ("user", username),
+            ("limit", &limit.unwrap_or(200).to_string()),
+            ("api_key", config::LASTFM_API_KEY),
+            ("format", "json"),
+        ],
+    )?;
+    let response = CLIENT.get(url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    let artists = json["topartists"]["artist"]
+        .as_array()
+        .ok_or("Invalid JSON format: 'topartists.artist' is not an array")
+        .into_iter()
+        .flatten()
+        .map(|artist_json| {
+            let name = artist_json["name"].as_str().unwrap_or_default().to_string();
+            let user_playcount = artist_json["playcount"]
+                .as_str()
+                .unwrap_or_default()
+                .parse::<u64>()
+                .unwrap_or_default();
+
+            Artist {
+                name,
+                listeners: 0,
+                playcount: 0,
+                user_playcount,
+                tags: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(artists)
 }
 
 // Get artists for a given user
@@ -861,88 +1018,96 @@ pub async fn fetch_artists(
     duration: &TimePeriod,
     api_type: &ApiType,
     limit: Option<usize>,
-) -> Result<Vec<Artist>, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(api_type);
-    let duration_str = time_period_to_api_string(duration, api_type);
-
+) -> Result<Vec<Artist>, BoxError> {
     match api_type {
-        ApiType::Listenbrainz => {
-            let url = format!(
-                "{}stats/user/{}/artists?range={}&count={}",
-                base_url,
-                username,
-                duration_str,
-                limit.unwrap_or(100)
-            );
-            let response = CLIENT.get(&url).send().await?;
-
-            let json = response.json::<serde_json::Value>().await?;
-
-            let artists = json["payload"]["artists"]
-                .as_array()
-                .ok_or("Invalid JSON format: 'payload.artists' is not an array")
-                .into_iter()
-                .flatten()
-                .map(|artists_json| {
-                    let name = artists_json["artist_name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    let user_playcount = artists_json["listen_count"].as_u64().unwrap_or_default();
-
-                    Artist {
-                        name,
-                        listeners: 0,
-                        playcount: 0,
-                        user_playcount,
-                        tags: None,
-                    }
-                })
-                .collect::<Vec<_>>();
-            Ok(artists)
-        }
+        ApiType::Listenbrainz => or_lastfm(
+            fetch_artists_listenbrainz(username, duration, limit),
+            fetch_artists_lastfm(username, duration, &ApiType::Lastfm, None),
+            |artists| !artists.is_empty(),
+        )
+        .await,
 
         ApiType::Librefm | ApiType::Lastfm => {
-            let url = Url::parse_with_params(
-                base_url,
-                &[
-                    ("method", "user.gettopartists"),
-                    ("period", duration_str),
-                    ("user", username),
-                    ("limit", &limit.unwrap_or(200).to_string()),
-                    ("api_key", config::LASTFM_API_KEY),
-                    ("format", "json"),
-                ],
-            )?;
-            let response = CLIENT.get(url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-
-            let artists = json["topartists"]["artist"]
-                .as_array()
-                .ok_or("Invalid JSON format: 'topartists.artist' is not an array")
-                .into_iter()
-                .flatten()
-                .map(|artist_json| {
-                    let name = artist_json["name"].as_str().unwrap_or_default().to_string();
-                    let user_playcount = artist_json["playcount"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .parse::<u64>()
-                        .unwrap_or_default();
-
-                    Artist {
-                        name,
-                        listeners: 0,
-                        playcount: 0,
-                        user_playcount,
-                        tags: None,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            Ok(artists)
+            fetch_artists_lastfm(username, duration, api_type, limit).await
         }
     }
+}
+
+async fn fetch_tracks_listenbrainz(
+    username: &str,
+    duration: &TimePeriod,
+    limit: Option<usize>,
+) -> Result<Vec<Track>, BoxError> {
+    let url = format!(
+        "{}stats/user/{}/recordings?range={}&count={}",
+        get_base_url(&ApiType::Listenbrainz),
+        username,
+        time_period_to_api_string(duration, &ApiType::Listenbrainz),
+        limit.unwrap_or(100)
+    );
+    let response = CLIENT.get(&url).send().await?;
+
+    let json = response.json::<serde_json::Value>().await?;
+
+    parse_listenbrainz_tracks(&json["payload"]["recordings"])
+}
+
+async fn fetch_tracks_lastfm(
+    username: &str,
+    duration: &TimePeriod,
+    api_type: &ApiType,
+    limit: Option<usize>,
+) -> Result<Vec<Track>, BoxError> {
+    let url = Url::parse_with_params(
+        get_base_url(api_type),
+        &[
+            ("method", "user.gettoptracks"),
+            ("period", time_period_to_api_string(duration, api_type)),
+            ("user", username),
+            ("limit", &limit.unwrap_or(200).to_string()),
+            ("api_key", config::LASTFM_API_KEY),
+            ("format", "json"),
+        ],
+    )?;
+    let response = CLIENT.get(url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+
+    let tracks = json["toptracks"]["track"]
+        .as_array()
+        .ok_or("Invalid JSON format: 'toptracks.track' is not an array")
+        .into_iter()
+        .flatten()
+        .map(|track_json| {
+            let name = track_json["name"].as_str().unwrap_or_default().to_string();
+            let user_playcount = track_json["playcount"]
+                .as_str()
+                .unwrap_or_default()
+                .parse::<u64>()
+                .unwrap_or_default();
+            let artist = track_json["artist"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+
+            Track {
+                name,
+                album: None,
+                artist,
+                album_art_url: None,
+                date: None,
+                duration: 0,
+                listeners: 0,
+                playcount: 0,
+                user_playcount,
+                now_playing: false,
+                user_loved: false,
+                tags: None,
+                recording_mbid: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(tracks)
 }
 
 // Get tracks for a given user
@@ -951,177 +1116,130 @@ pub async fn fetch_tracks(
     duration: &TimePeriod,
     api_type: &ApiType,
     limit: Option<usize>,
-) -> Result<Vec<Track>, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(api_type);
-    let duration_str = time_period_to_api_string(duration, api_type);
-
+) -> Result<Vec<Track>, BoxError> {
     match api_type {
-        ApiType::Listenbrainz => {
-            let url = format!(
-                "{}stats/user/{}/recordings?range={}&count={}",
-                base_url,
-                username,
-                duration_str,
-                limit.unwrap_or(100)
-            );
-            let response = CLIENT.get(&url).send().await?;
-
-            let json = response.json::<serde_json::Value>().await?;
-
-            let tracks = parse_listenbrainz_tracks(&json["payload"]["recordings"])?;
-            Ok(tracks)
-        }
+        ApiType::Listenbrainz => or_lastfm(
+            fetch_tracks_listenbrainz(username, duration, limit),
+            fetch_tracks_lastfm(username, duration, &ApiType::Lastfm, None),
+            |tracks| !tracks.is_empty(),
+        )
+        .await,
 
         ApiType::Librefm | ApiType::Lastfm => {
-            let url = Url::parse_with_params(
-                base_url,
-                &[
-                    ("method", "user.gettoptracks"),
-                    ("period", duration_str),
-                    ("user", username),
-                    ("limit", &limit.unwrap_or(200).to_string()),
-                    ("api_key", config::LASTFM_API_KEY),
-                    ("format", "json"),
-                ],
-            )?;
-            let response = CLIENT.get(url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-
-            let tracks = json["toptracks"]["track"]
-                .as_array()
-                .ok_or("Invalid JSON format: 'toptracks.track' is not an array")
-                .into_iter()
-                .flatten()
-                .map(|track_json| {
-                    let name = track_json["name"].as_str().unwrap_or_default().to_string();
-                    let user_playcount = track_json["playcount"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .parse::<u64>()
-                        .unwrap_or_default();
-                    let artist = track_json["artist"]["name"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-
-                    Track {
-                        name,
-                        album: None,
-                        artist,
-                        album_art_url: None,
-                        date: None,
-                        duration: 0,
-                        listeners: 0,
-                        playcount: 0,
-                        user_playcount,
-                        now_playing: false,
-                        user_loved: false,
-                        tags: None,
-                        recording_mbid: None,
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            Ok(tracks)
+            fetch_tracks_lastfm(username, duration, api_type, limit).await
         }
     }
+}
+
+async fn fetch_user_info_listenbrainz(username: &str) -> Result<ScrobbleUser, BoxError> {
+    let base_url = get_base_url(&ApiType::Listenbrainz);
+
+    let url = format!("{base_url}user/{username}/listen-count");
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+    let playcount = json["payload"]["count"].as_u64().unwrap_or_default();
+
+    let url = format!("{base_url}stats/user/{username}/artists");
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+    let artist_count = json["payload"]["total_artist_count"]
+        .as_u64()
+        .unwrap_or_default();
+
+    let url = format!("{base_url}stats/user/{username}/releases");
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+    let track_count = json["payload"]["total_release_count"]
+        .as_u64()
+        .unwrap_or_default();
+
+    let url = format!("{base_url}stats/user/{username}/recordings");
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+    let album_count = json["payload"]["total_recording_count"]
+        .as_u64()
+        .unwrap_or_default();
+
+    Ok(ScrobbleUser {
+        username: username.to_owned(),
+        playcount,
+        artist_count,
+        track_count,
+        album_count,
+        profile_pic_url: None,
+        registered_date: None,
+    })
+}
+
+async fn fetch_user_info_lastfm(
+    username: &str,
+    api_type: &ApiType,
+) -> Result<ScrobbleUser, BoxError> {
+    let url = Url::parse_with_params(
+        get_base_url(api_type),
+        &[
+            ("method", "user.getInfo"),
+            ("user", username),
+            ("api_key", config::LASTFM_API_KEY),
+            ("format", "json"),
+        ],
+    )?;
+    let response = CLIENT.get(url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+    let user_json = &json["user"];
+    let playcount = user_json["playcount"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<u64>()
+        .unwrap_or_default();
+    let artist_count = user_json["artist_count"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<u64>()
+        .unwrap_or_default();
+    let track_count = user_json["track_count"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<u64>()
+        .unwrap_or_default();
+    let album_count = user_json["album_count"]
+        .as_str()
+        .unwrap_or_default()
+        .parse::<u64>()
+        .unwrap_or_default();
+    let registered_date = if let Some(registered) = user_json["registered"].get("#text") {
+        registered.as_u64()
+    } else {
+        None
+    };
+    let profile_pic_url = get_biggest_lastfm_image(user_json);
+
+    Ok(ScrobbleUser {
+        username: username.to_owned(),
+        playcount,
+        artist_count,
+        track_count,
+        album_count,
+        profile_pic_url,
+        registered_date,
+    })
 }
 
 // Get info for a given user
 pub async fn fetch_user_info(
     username: &str,
     api_type: &ApiType,
-) -> Result<ScrobbleUser, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(api_type);
-
+) -> Result<ScrobbleUser, BoxError> {
     match api_type {
-        ApiType::Listenbrainz => {
-            let url = format!("https://api.listenbrainz.org/1/user/{username}/listen-count");
-            let response = CLIENT.get(&url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let playcount = json["payload"]["count"].as_u64().unwrap_or_default();
+        ApiType::Listenbrainz => or_lastfm(
+            fetch_user_info_listenbrainz(username),
+            fetch_user_info_lastfm(username, &ApiType::Lastfm),
+            // A live ListenBrainz account always reports a listen count; an all-zero
+            // profile means the stats endpoints returned nothing useful.
+            |user| user.playcount > 0,
+        )
+        .await,
 
-            let url = format!("https://api.listenbrainz.org/1/stats/user/{username}/artists");
-            let response = CLIENT.get(&url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let artist_count = json["payload"]["total_artist_count"]
-                .as_u64()
-                .unwrap_or_default();
-
-            let url = format!("https://api.listenbrainz.org/1/stats/user/{username}/releases");
-            let response = CLIENT.get(&url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let track_count = json["payload"]["total_release_count"]
-                .as_u64()
-                .unwrap_or_default();
-
-            let url = format!("https://api.listenbrainz.org/1/stats/user/{username}/recordings");
-            let response = CLIENT.get(&url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let album_count = json["payload"]["total_recording_count"]
-                .as_u64()
-                .unwrap_or_default();
-
-            let user = ScrobbleUser {
-                username: username.to_owned(),
-                playcount,
-                artist_count,
-                track_count,
-                album_count,
-                profile_pic_url: None,
-                registered_date: None,
-            };
-            Ok(user)
-        }
-        ApiType::Librefm | ApiType::Lastfm => {
-            let url = Url::parse_with_params(
-                base_url,
-                &[
-                    ("method", "user.getInfo"),
-                    ("user", username),
-                    ("api_key", config::LASTFM_API_KEY),
-                    ("format", "json"),
-                ],
-            )?;
-            let response = CLIENT.get(url).send().await?;
-            let json = response.json::<serde_json::Value>().await?;
-            let user_json = &json["user"];
-            let playcount = user_json["playcount"]
-                .as_str()
-                .unwrap_or_default()
-                .parse::<u64>()
-                .unwrap_or_default();
-            let artist_count = user_json["artist_count"]
-                .as_str()
-                .unwrap_or_default()
-                .parse::<u64>()
-                .unwrap_or_default();
-            let track_count = user_json["track_count"]
-                .as_str()
-                .unwrap_or_default()
-                .parse::<u64>()
-                .unwrap_or_default();
-            let album_count = user_json["album_count"]
-                .as_str()
-                .unwrap_or_default()
-                .parse::<u64>()
-                .unwrap_or_default();
-            let registered_date = if let Some(registered) = user_json["registered"].get("#text") {
-                registered.as_u64()
-            } else {
-                None
-            };
-            let profile_pic_url = get_biggest_lastfm_image(user_json);
-            let user = ScrobbleUser {
-                username: username.to_owned(),
-                playcount,
-                artist_count,
-                track_count,
-                album_count,
-                profile_pic_url,
-                registered_date,
-            };
-            Ok(user)
-        }
+        ApiType::Librefm | ApiType::Lastfm => fetch_user_info_lastfm(username, api_type).await,
     }
 }

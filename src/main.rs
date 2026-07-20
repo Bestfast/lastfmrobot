@@ -471,7 +471,21 @@ async fn status_command(
 
             let mut user_playcount = 0;
             let mut tags_text: String = "".to_string();
-            if user.api_type() == ApiType::Lastfm {
+
+            if user.api_type() == ApiType::Listenbrainz {
+                user_playcount = api_requester::fetch_listenbrainz_track_playcount(
+                    user.account_username.as_str(),
+                    tracks[0].artist.as_str(),
+                    tracks[0].name.as_str(),
+                    tracks[0].recording_mbid.as_deref(),
+                )
+                .await
+                .unwrap_or_default();
+            }
+
+            // Last.fm is the source for tags, and also the fallback for the play count when
+            // ListenBrainz is down or hasn't indexed the track yet (same username assumed).
+            if user.api_type() != ApiType::Librefm && user_playcount == 0 {
                 let track_info = api_requester::fetch_lastfm_track(
                     user.account_username.clone().into(),
                     tracks[0].artist.clone(),
@@ -498,15 +512,6 @@ async fn status_command(
                         .collect::<Vec<_>>()
                         .join(" ");
                 }
-            } else if user.api_type() == ApiType::Listenbrainz {
-                user_playcount = api_requester::fetch_listenbrainz_track_playcount(
-                    user.account_username.as_str(),
-                    tracks[0].artist.as_str(),
-                    tracks[0].name.as_str(),
-                    tracks[0].recording_mbid.as_deref(),
-                )
-                .await
-                .unwrap_or_default();
             }
 
             let mut first_track_info = if user_playcount > 0 {
@@ -1285,7 +1290,11 @@ async fn random_command(
             if let Some(track) = track {
                 search_text = (track.artist.clone() + " " + &track.name.clone()).into();
 
-                if user.api_type() == ApiType::Lastfm {
+                // ListenBrainz recordings carry their own cover art; only ask Last.fm when
+                // the track came back without any (including via the Last.fm fallback).
+                album_art_url = track.album_art_url.clone();
+
+                if album_art_url.is_none() && user.api_type() != ApiType::Librefm {
                     let track_info = api_requester::fetch_lastfm_track(
                         None,
                         track.artist.clone(),
