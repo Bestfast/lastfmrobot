@@ -467,7 +467,8 @@ async fn status_command(
                 return Ok(());
             }
 
-            let album_art_url = tracks[0].album_art_url.as_ref();
+            let album_art_url =
+                api_requester::resolve_cover_art_url(tracks[0].album_art_url.as_deref()).await;
 
             let mut user_playcount = 0;
             let mut tags_text: String = "".to_string();
@@ -584,7 +585,8 @@ async fn status_command(
                     ));
                 }
                 StatusType::Compact => {
-                    if tracks[0].album_art_url.is_some() {
+                    // Offer the cover button only for art we've confirmed is sendable.
+                    if album_art_url.is_some() {
                         keyboard[0].push(InlineKeyboardButton::callback(
                             "🖼️",
                             format!("{} status {}", from.id.0, StatusType::CompactWithCover),
@@ -624,7 +626,7 @@ async fn status_command(
                 utils::send_or_edit_photo(
                     bot,
                     InputMediaPhoto::new(InputFile::url(Url::parse(
-                        album_art_url.map_or(consts::LASTFM_STAR_URL, |v| v),
+                        album_art_url.as_deref().unwrap_or(consts::LASTFM_STAR_URL),
                     )?))
                     .caption(text)
                     .show_caption_above_media(true),
@@ -1351,10 +1353,11 @@ async fn random_command(
                 )
                 .await?;
             } else {
+                let album_art_url =
+                    api_requester::resolve_cover_art_url(album_art_url.as_deref()).await;
+
                 let media = InputMediaPhoto::new(InputFile::url(Url::parse(
-                    album_art_url
-                        .as_ref()
-                        .map_or(consts::LASTFM_STAR_URL, |v| v),
+                    album_art_url.as_deref().unwrap_or(consts::LASTFM_STAR_URL),
                 )?))
                 .caption(text);
 

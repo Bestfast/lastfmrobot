@@ -7,7 +7,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 
-use crate::api_requester::{Album, CLIENT_NOCACHE};
+use crate::api_requester::{Album, CLIENT_NOCACHE, cover_art_candidates};
 use crate::config;
 
 const FONT_SIZE: f32 = 24.0;
@@ -15,23 +15,33 @@ const TILE_PX: u32 = 300;
 pub const MAX_SIZE: u32 = 7;
 pub const MIN_SIZE: u32 = 1;
 
+// Cover Art Archive redirects every size to archive.org without checking that the
+// thumbnail exists, so a missing size shows up as a failed download here rather than at
+// URL-building time. Walk down the sizes until one comes back.
+async fn fetch_album_art(url: String) -> Result<Bytes, anyhow::Error> {
+    let mut last_err = anyhow!("no cover art url");
+
+    for candidate in cover_art_candidates(&url) {
+        match CLIENT_NOCACHE.get(&candidate).send().await {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+                Ok(_) => last_err = anyhow!("empty response for {candidate}"),
+                Err(e) => last_err = anyhow!(e),
+            },
+            Err(e) => last_err = anyhow!(e),
+        }
+    }
+
+    Err(last_err)
+}
+
 async fn fetch_album_arts(albums: &[&Album]) -> Vec<Result<Bytes, anyhow::Error>> {
     let mut handles = Vec::new();
     albums
         .iter()
-        .map(|album| {
-            CLIENT_NOCACHE
-                .get(album.album_art_url.as_ref().unwrap())
-                .send()
-        })
-        .for_each(|fut| {
-            let handle = tokio::spawn(async move {
-                let resp = fut.await;
-                match resp {
-                    Ok(resp) => Ok(resp.bytes().await.unwrap_or_default()),
-                    Err(e) => Err(anyhow!(e)),
-                }
-            });
+        .map(|album| album.album_art_url.clone().unwrap())
+        .for_each(|url| {
+            let handle = tokio::spawn(fetch_album_art(url));
             handles.push(handle);
         });
 

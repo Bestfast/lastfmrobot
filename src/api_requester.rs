@@ -220,6 +220,73 @@ async fn or_lastfm<T>(
     }
 }
 
+// Cover Art Archive serves the original upload at `/front` plus fixed thumbnails at
+// `/front-250`, `/front-500` and `/front-1200` — those are the only sizes that exist.
+// We prefer 1200 (the largest thumbnail) over the original because originals are
+// unbounded: lossless scans of several MB are common, and Telegram rejects photos sent
+// by URL above 10MB. CAA answers 307 for every size without checking, so a missing
+// thumbnail only surfaces as a 404 from archive.org once the redirect is followed —
+// hence the step-down list rather than a single URL.
+pub const CAA_SIZES: [u16; 3] = [1200, 500, 250];
+
+pub fn caa_front_url(mbid: &str, size: u16) -> String {
+    format!("https://coverartarchive.org/release/{mbid}/front-{size}")
+}
+
+/// URL for the largest cover art size we're willing to serve.
+pub fn caa_front_url_largest(mbid: &str) -> String {
+    caa_front_url(mbid, CAA_SIZES[0])
+}
+
+/// Rewrite a CAA front URL to a different size, leaving non-CAA URLs untouched.
+pub fn caa_front_url_with_size(url: &str, size: u16) -> Option<String> {
+    let (base, current) = url.rsplit_once("/front-")?;
+    current.parse::<u16>().ok()?;
+    Some(format!("{base}/front-{size}"))
+}
+
+/// The urls worth trying for one cover art image, largest first. Hosts other than CAA
+/// (Last.fm) have no size variants, so they yield the single url they came with.
+pub fn cover_art_candidates(url: &str) -> Vec<String> {
+    if caa_front_url_with_size(url, CAA_SIZES[0]).is_some() {
+        CAA_SIZES
+            .iter()
+            .filter_map(|&size| caa_front_url_with_size(url, size))
+            .collect()
+    } else {
+        vec![url.to_string()]
+    }
+}
+
+/// Confirm a cover art url really serves an image, returning the largest size that does.
+///
+/// ListenBrainz gives us a release mbid even when the Cover Art Archive holds no art for
+/// it, and CAA answers those with a 404 *html* page. Handing that to Telegram fails the
+/// send with "wrong type of the web page content", so the url has to be checked here
+/// rather than trusted. Returning None lets the caller fall back to the placeholder.
+pub async fn resolve_cover_art_url(url: Option<&str>) -> Option<String> {
+    for candidate in cover_art_candidates(url?) {
+        // Response200Middleware turns CAA's 404 into an error, so a response here is
+        // already 2xx; the content type still has to be checked in case a host answers
+        // 200 with an error page.
+        let Ok(response) = CLIENT_NOCACHE.head(&candidate).send().await else {
+            continue;
+        };
+
+        let is_image = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|content_type| content_type.starts_with("image/"));
+
+        if is_image {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 fn get_base_url(api_type: &ApiType) -> &'static str {
     match api_type {
         ApiType::Lastfm => "https://ws.audioscrobbler.com/2.0/",
@@ -542,7 +609,7 @@ pub fn parse_listenbrainz_tracks_np(
                 .or_else(|| track_metadata["mbid_mapping"]["release_mbid"].as_str())
                 .or_else(|| track_metadata["additional_info"]["release_mbid"].as_str())
                 .or_else(|| track_metadata["release_mbid"].as_str())
-                .map(|mbid| format!("https://coverartarchive.org/release/{mbid}/front-500"));
+                .map(caa_front_url_largest);
             let recording_mbid = track_metadata["mbid_mapping"]["recording_mbid"]
                 .as_str()
                 .or_else(|| track_metadata["additional_info"]["recording_mbid"].as_str())
@@ -832,9 +899,13 @@ async fn fetch_albums_listenbrainz(
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            let album_art_url = album_json["release_mbid"]
+            // `caa_release_mbid` is the release CAA actually holds art for; it
+            // differs from `release_mbid` when art lives on another release in
+            // the group, so prefer it and only fall back to the plain mbid.
+            let album_art_url = album_json["caa_release_mbid"]
                 .as_str()
-                .map(|mbid| format!("https://coverartarchive.org/release/{mbid}/front-500"));
+                .or_else(|| album_json["release_mbid"].as_str())
+                .map(caa_front_url_largest);
             let user_playcount = album_json["listen_count"].as_u64().unwrap_or_default();
 
             Album {
@@ -1241,5 +1312,101 @@ pub async fn fetch_user_info(
         .await,
 
         ApiType::Librefm | ApiType::Lastfm => fetch_user_info_lastfm(username, api_type).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn largest_url_uses_biggest_size() {
+        assert_eq!(
+            caa_front_url_largest("abc"),
+            "https://coverartarchive.org/release/abc/front-1200"
+        );
+    }
+
+    #[test]
+    fn sizes_are_ordered_largest_first() {
+        let mut sorted = CAA_SIZES;
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(CAA_SIZES, sorted);
+    }
+
+    #[test]
+    fn rewrites_size_of_caa_url() {
+        let url = caa_front_url_largest("abc");
+        assert_eq!(
+            caa_front_url_with_size(&url, 250).as_deref(),
+            Some("https://coverartarchive.org/release/abc/front-250")
+        );
+    }
+
+    #[test]
+    fn leaves_non_caa_urls_alone() {
+        // Last.fm images have no size variants to swap.
+        assert_eq!(
+            caa_front_url_with_size("https://lastfm.freetls.fastly.net/i/u/300x300/abc.png", 250),
+            None
+        );
+        // `/front` without a size suffix isn't a rewrite target either.
+        assert_eq!(
+            caa_front_url_with_size("https://coverartarchive.org/release/abc/front", 250),
+            None
+        );
+        // A non-numeric suffix must not be treated as a size.
+        assert_eq!(
+            caa_front_url_with_size("https://coverartarchive.org/release/abc/front-large", 250),
+            None
+        );
+    }
+
+    #[test]
+    fn candidates_are_largest_first_for_caa() {
+        let c = cover_art_candidates(&caa_front_url_largest("abc"));
+        assert_eq!(
+            c,
+            vec![
+                "https://coverartarchive.org/release/abc/front-1200",
+                "https://coverartarchive.org/release/abc/front-500",
+                "https://coverartarchive.org/release/abc/front-250",
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_for_non_caa_host_are_just_the_url() {
+        let url = "https://lastfm.freetls.fastly.net/i/u/300x300/abc.png";
+        assert_eq!(cover_art_candidates(url), vec![url]);
+    }
+
+    // Network-gated: `cargo test -- --ignored`. These pin the exact behaviour that broke
+    // the bot, so they are worth keeping even though they need the live CAA.
+    #[tokio::test]
+    #[ignore]
+    async fn resolves_release_without_art_to_none() {
+        // ListenBrainz reports these release mbids with no caa_release_mbid; CAA answers
+        // with a 404 html page, which Telegram rejects as "wrong type of web page content".
+        for mbid in [
+            "b479acee-3cde-49af-83cc-2c8054d089e9",
+            "d229f806-0639-4b8c-bce6-1d4f01824be3",
+        ] {
+            let url = caa_front_url_largest(mbid);
+            assert_eq!(resolve_cover_art_url(Some(&url)).await, None, "{mbid}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn resolves_release_with_art_to_largest_size() {
+        let url = caa_front_url_largest("0d932a42-b3f5-419c-bc28-332d4a2b7f87");
+        assert_eq!(resolve_cover_art_url(Some(&url)).await, Some(url));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn resolves_none_to_none() {
+        assert_eq!(resolve_cover_art_url(None).await, None);
     }
 }
