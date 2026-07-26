@@ -467,7 +467,7 @@ async fn status_command(
                 return Ok(());
             }
 
-            let album_art_url =
+            let mut album_art_url =
                 api_requester::resolve_cover_art_url(tracks[0].album_art_url.as_deref()).await;
 
             let mut user_playcount = 0;
@@ -484,9 +484,14 @@ async fn status_command(
                 .unwrap_or_default();
             }
 
-            // Last.fm is the source for tags, and also the fallback for the play count when
-            // ListenBrainz is down or hasn't indexed the track yet (same username assumed).
-            if user.api_type() != ApiType::Librefm && user_playcount == 0 {
+            // Last.fm is the source for tags, and the fallback for the play count when
+            // ListenBrainz is down or hasn't indexed the track yet (same username assumed),
+            // as well as for cover art: the Cover Art Archive holds nothing for plenty of
+            // releases ListenBrainz maps a listen to, and a playing-now listen often carries
+            // no release mbid at all, both of which leave the resolved url empty.
+            if user.api_type() != ApiType::Librefm
+                && (user_playcount == 0 || album_art_url.is_none())
+            {
                 let track_info = api_requester::fetch_lastfm_track(
                     user.account_username.clone().into(),
                     tracks[0].artist.clone(),
@@ -495,7 +500,33 @@ async fn status_command(
                 .await;
 
                 if let Ok(track_info) = track_info {
-                    user_playcount = track_info.user_playcount;
+                    if user_playcount == 0 {
+                        user_playcount = track_info.user_playcount;
+                    }
+
+                    if album_art_url.is_none() {
+                        // track.getInfo only carries a cover when Last.fm knows which album
+                        // the track belongs to; when it doesn't, the album name that came
+                        // with the listen gets us to the same art through album.getInfo.
+                        let mut candidate = track_info.album_art_url;
+
+                        if candidate.is_none()
+                            && let Some(album) = tracks[0].album.as_deref()
+                        {
+                            candidate = api_requester::fetch_lastfm_album(
+                                user.account_username.as_str(),
+                                tracks[0].artist.as_str(),
+                                album,
+                            )
+                            .await
+                            .ok()
+                            .and_then(|album| album.album_art_url);
+                        }
+
+                        album_art_url =
+                            api_requester::resolve_cover_art_url(candidate.as_deref()).await;
+                    }
+
                     tags_text = track_info
                         .tags
                         .unwrap_or_default()

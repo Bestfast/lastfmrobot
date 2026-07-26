@@ -245,13 +245,35 @@ pub fn caa_front_url_with_size(url: &str, size: u16) -> Option<String> {
     Some(format!("{base}/front-{size}"))
 }
 
-/// The urls worth trying for one cover art image, largest first. Hosts other than CAA
-/// (Last.fm) have no size variants, so they yield the single url they came with.
+// Last.fm serves every image at a fixed set of sizes under `/i/u/<size>/<hash>`, and the
+// size its api hands back (`300x300` for the largest entry of an `image` array) is not
+// always one that was actually generated — the cdn answers those with a 404 html page,
+// the same thing Telegram chokes on. So Last.fm urls get a step-down list too. `770x0` is
+// the largest size on offer and stays far below Telegram's 10MB limit for photos by url.
+pub const LASTFM_IMAGE_SIZES: [&str; 6] = ["770x0", "500x500", "300x300", "174s", "64s", "34s"];
+
+/// Rewrite a Last.fm image URL to a different size, leaving other URLs untouched.
+pub fn lastfm_image_url_with_size(url: &str, size: &str) -> Option<String> {
+    let (base, path) = url.split_once("/i/u/")?;
+    let (current, file) = path.split_once('/')?;
+    if current.is_empty() || file.contains('/') {
+        return None;
+    }
+    Some(format!("{base}/i/u/{size}/{file}"))
+}
+
+/// The urls worth trying for one cover art image, largest first. Hosts we know no size
+/// variants for yield the single url they came with.
 pub fn cover_art_candidates(url: &str) -> Vec<String> {
     if caa_front_url_with_size(url, CAA_SIZES[0]).is_some() {
         CAA_SIZES
             .iter()
             .filter_map(|&size| caa_front_url_with_size(url, size))
+            .collect()
+    } else if lastfm_image_url_with_size(url, LASTFM_IMAGE_SIZES[0]).is_some() {
+        LASTFM_IMAGE_SIZES
+            .iter()
+            .filter_map(|&size| lastfm_image_url_with_size(url, size))
             .collect()
     } else {
         vec![url.to_string()]
@@ -296,13 +318,16 @@ fn get_base_url(api_type: &ApiType) -> &'static str {
 }
 
 fn get_biggest_lastfm_image(json_value: &serde_json::Value) -> Option<String> {
+    // Sizes come smallest first, so the last one that actually carries a url is the
+    // biggest. Last.fm sometimes leaves the largest sizes blank, hence the rev().
     let url = json_value["image"]
         .as_array()
         .and_then(|images| {
             images
                 .iter()
-                .last()
-                .and_then(|image| image["#text"].as_str())
+                .rev()
+                .filter_map(|image| image["#text"].as_str())
+                .find(|text| !text.is_empty())
                 .map(|text| text.to_string())
         })
         .unwrap_or_default();
@@ -508,7 +533,7 @@ pub async fn fetch_lastfm_album(
         listeners,
         playcount,
         user_playcount,
-        album_art_url: None,
+        album_art_url: get_biggest_lastfm_image(&json["album"]),
         tags: Some(tags),
     })
 }
@@ -1345,7 +1370,7 @@ mod tests {
 
     #[test]
     fn leaves_non_caa_urls_alone() {
-        // Last.fm images have no size variants to swap.
+        // Last.fm images have sizes of their own, swapped by their own helper.
         assert_eq!(
             caa_front_url_with_size("https://lastfm.freetls.fastly.net/i/u/300x300/abc.png", 250),
             None
@@ -1376,8 +1401,45 @@ mod tests {
     }
 
     #[test]
-    fn candidates_for_non_caa_host_are_just_the_url() {
-        let url = "https://lastfm.freetls.fastly.net/i/u/300x300/abc.png";
+    fn rewrites_size_of_lastfm_url() {
+        assert_eq!(
+            lastfm_image_url_with_size(
+                "https://lastfm.freetls.fastly.net/i/u/300x300/abc.png",
+                "770x0"
+            )
+            .as_deref(),
+            Some("https://lastfm.freetls.fastly.net/i/u/770x0/abc.png")
+        );
+    }
+
+    #[test]
+    fn leaves_non_lastfm_urls_alone() {
+        // A sizeless image url has nothing to swap...
+        assert_eq!(
+            lastfm_image_url_with_size("https://lastfm.freetls.fastly.net/i/u/abc.png", "770x0"),
+            None
+        );
+        // ...and neither has a url from another host.
+        assert_eq!(
+            lastfm_image_url_with_size("https://coverartarchive.org/release/abc/front-1200", "34s"),
+            None
+        );
+    }
+
+    #[test]
+    fn candidates_are_largest_first_for_lastfm() {
+        let c = cover_art_candidates("https://lastfm.freetls.fastly.net/i/u/300x300/abc.png");
+        assert_eq!(c.len(), LASTFM_IMAGE_SIZES.len());
+        assert_eq!(c[0], "https://lastfm.freetls.fastly.net/i/u/770x0/abc.png");
+        assert_eq!(
+            c.last().unwrap(),
+            "https://lastfm.freetls.fastly.net/i/u/34s/abc.png"
+        );
+    }
+
+    #[test]
+    fn candidates_for_unknown_host_are_just_the_url() {
+        let url = "https://example.com/cover.png";
         assert_eq!(cover_art_candidates(url), vec![url]);
     }
 
@@ -1402,6 +1464,19 @@ mod tests {
     async fn resolves_release_with_art_to_largest_size() {
         let url = caa_front_url_largest("0d932a42-b3f5-419c-bc28-332d4a2b7f87");
         assert_eq!(resolve_cover_art_url(Some(&url)).await, Some(url));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn resolves_lastfm_url_whose_own_size_is_missing() {
+        // Last.fm gives this album's cover out as 300x300, a size its cdn 404s; the art
+        // itself is there at every other size.
+        let hash = "2ae8513eff8778953057e10a00d45415.jpg";
+        let url = format!("https://lastfm.freetls.fastly.net/i/u/300x300/{hash}");
+        assert_eq!(
+            resolve_cover_art_url(Some(&url)).await,
+            Some(format!("https://lastfm.freetls.fastly.net/i/u/770x0/{hash}"))
+        );
     }
 
     #[tokio::test]

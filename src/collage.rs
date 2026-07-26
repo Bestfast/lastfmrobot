@@ -17,11 +17,18 @@ pub const MIN_SIZE: u32 = 1;
 
 // Cover Art Archive redirects every size to archive.org without checking that the
 // thumbnail exists, so a missing size shows up as a failed download here rather than at
-// URL-building time. Walk down the sizes until one comes back.
+// URL-building time. Last.fm has the same problem: the size its api hands out isn't
+// always one the cdn actually has. Walk down the sizes until one comes back.
+//
+// The url we were given is tried first: tiles are only TILE_PX wide, so there is nothing
+// to gain from pulling a larger variant when the size that came with the url works.
 async fn fetch_album_art(url: String) -> Result<Bytes, anyhow::Error> {
     let mut last_err = anyhow!("no cover art url");
 
-    for candidate in cover_art_candidates(&url) {
+    let candidates = std::iter::once(url.clone())
+        .chain(cover_art_candidates(&url).into_iter().filter(|c| *c != url));
+
+    for candidate in candidates {
         match CLIENT_NOCACHE.get(&candidate).send().await {
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
