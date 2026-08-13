@@ -198,6 +198,17 @@ pub static CLIENT_NOCACHE: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
     .build()
 });
 
+// Probing needs the *raw* status code (not Response200Middleware's error) so a clean 404
+// ("definitively no art") can be told apart from a timeout/5xx ("transient, don't cache").
+static CLIENT_PROBE: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .https_only(true)
+        .user_agent("LastFM Robot (Telegram bot)")
+        .build()
+        .unwrap()
+});
+
 // MusicBrainz requires a descriptive User-Agent (with contact info) or it answers 403.
 // Responses are cached like the other clients; genres are effectively immutable.
 static CLIENT_MB: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
@@ -388,44 +399,75 @@ fn cover_art_cache_key(url: &str) -> String {
     url.to_string()
 }
 
-async fn probe_one(candidate: String) -> bool {
-    // Response200Middleware turns CAA's 404 into an error, so a response here is already
-    // 2xx; the content type still has to be checked in case a host answers 200 with an
-    // error page.
-    let Ok(response) = CLIENT_NOCACHE.head(&candidate).send().await else {
-        return false;
-    };
+enum ProbeOutcome {
+    /// A candidate actually serves an image.
+    Image(String),
+    /// The host answered definitively that this size has no art (404, or 2xx error page).
+    NoArt,
+    /// Network error/timeout/5xx - transient, must not be treated as "no art".
+    Unknown,
+}
 
-    response
+async fn probe_one(candidate: &str) -> ProbeOutcome {
+    let Ok(response) = CLIENT_PROBE.head(candidate).send().await else {
+        return ProbeOutcome::Unknown;
+    };
+    let status = response.status();
+    let is_image = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| content_type.starts_with("image/"))
+        .is_some_and(|content_type| content_type.starts_with("image/"));
+
+    if status.is_success() && is_image {
+        ProbeOutcome::Image(candidate.to_string())
+    } else if status.is_server_error() {
+        ProbeOutcome::Unknown
+    } else {
+        // 4xx, or a 2xx that isn't an image (CAA answers missing art with a 404 html page
+        // after its redirect; some hosts answer 200 with an error page) - both definitive.
+        ProbeOutcome::NoArt
+    }
 }
 
-/// Probe every candidate size at once — a miss then costs one round trip instead of one
-/// per size — and return the first (most preferred) size that actually serves an image.
-async fn probe_cover_art(url: &str) -> Option<String> {
+/// Probe every candidate size at once - a miss then costs one round trip instead of one
+/// per size - and return the first (most preferred) size that actually serves an image.
+/// `NoArt` means every candidate answered definitively; `Unknown` means at least one
+/// candidate failed transiently, in which case the caller must NOT cache a negative.
+async fn probe_cover_art(url: &str) -> ProbeOutcome {
     let candidates = cover_art_candidates(url);
 
     let mut handles = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
         let candidate = candidate.clone();
         handles.push(tokio::task::spawn(async move {
-            (candidate.clone(), probe_one(candidate).await)
+            (candidate.clone(), probe_one(&candidate).await)
         }));
     }
 
-    let t0 = std::time::Instant::now();
-    for handle in handles {
-        if let Ok((candidate, true)) = handle.await {
-            log::debug!("api: cover probe found after {:?}", t0.elapsed());
-            return Some(candidate);
+    let mut best: Option<(usize, String)> = None;
+    let mut saw_unknown = false;
+    for (index, handle) in handles.into_iter().enumerate() {
+        if let Ok((_, outcome)) = handle.await {
+            match outcome {
+                ProbeOutcome::Image(found) => {
+                    if best.is_none() || index < best.as_ref().unwrap().0 {
+                        best = Some((index, found));
+                    }
+                }
+                ProbeOutcome::Unknown => saw_unknown = true,
+                ProbeOutcome::NoArt => {}
+            }
+        } else {
+            saw_unknown = true;
         }
     }
-    log::debug!("api: cover probe all missed after {:?}", t0.elapsed());
 
-    None
+    match best {
+        Some((_, found)) => ProbeOutcome::Image(found),
+        None if saw_unknown => ProbeOutcome::Unknown,
+        None => ProbeOutcome::NoArt,
+    }
 }
 
 /// First artist of a multi-artist credit ("A, B, C" -> "A"), else the whole name.
@@ -500,15 +542,29 @@ pub async fn resolve_cover_art_url(url: Option<&str>) -> Option<String> {
         None => {}
     }
 
-    let resolved = probe_cover_art(url).await;
+    let outcome = probe_cover_art(url).await;
 
-    crate::db::DB
-        .lock()
-        .unwrap()
-        .store_cover_art(&key, resolved.as_deref())
-        .ok();
-
-    resolved
+    match outcome {
+        ProbeOutcome::Image(resolved) => {
+            crate::db::DB
+                .lock()
+                .unwrap()
+                .store_cover_art(&key, Some(&resolved))
+                .ok();
+            Some(resolved)
+        }
+        // Only a definitive miss gets negative-cached; a transient failure (timeout/5xx)
+        // is left uncached so the next status re-probes instead of hiding art for 6h.
+        ProbeOutcome::NoArt => {
+            crate::db::DB
+                .lock()
+                .unwrap()
+                .store_cover_art(&key, None)
+                .ok();
+            None
+        }
+        ProbeOutcome::Unknown => None,
+    }
 }
 
 // The image bytes behind a resolved cover url, cached in memory. Keyed on the resolved
