@@ -577,30 +577,15 @@ async fn status_command(
                     let start = std::time::Instant::now();
                     let mut resolved = api_requester::resolve_cover_art_url(Some(&url)).await;
 
-                    if resolved.is_none() && api_type != ApiType::Librefm {
-                        if let Ok(track_info) = api_requester::fetch_lastfm_track(
-                            Some(account_username.clone()),
-                            artist.clone(),
-                            track_name,
+                    if resolved.is_none() {
+                        resolved = api_requester::resolve_cover_art_fallback(
+                            &account_username,
+                            &api_type,
+                            track_name.as_str(),
+                            artist.as_str(),
+                            album.as_deref(),
                         )
-                        .await
-                        {
-                            let mut candidate = track_info.album_art_url;
-                            if candidate.is_none()
-                                && let Some(album) = album.as_deref()
-                            {
-                                candidate = api_requester::fetch_lastfm_album(
-                                    &account_username,
-                                    &artist,
-                                    album,
-                                )
-                                .await
-                                .ok()
-                                .and_then(|album| album.album_art_url);
-                            }
-                            resolved =
-                                api_requester::resolve_cover_art_url(candidate.as_deref()).await;
-                        }
+                        .await;
                     }
 
                     if let Some(resolved) = &resolved {
@@ -690,17 +675,21 @@ async fn status_command(
 
                     if needs_cover && album_art_url.is_none() {
                         // CAA (or the primary Last.fm url) holds no art for this release,
-                        // so fall back to Last.fm's own track/album art. The secondary
-                        // source is reached even when the primary is a cached miss; that
-                        // miss only says the primary url is dead, not that Last.fm has
-                        // nothing. Repeats stay cheap: the API calls are cached and the
-                        // secondary candidate url is negative-cached once probed.
-                        let candidate = track_info
-                            .album_art_url
-                            .or_else(|| album_info.as_ref().and_then(|a| a.album_art_url.clone()));
-
-                        album_art_url =
-                            api_requester::resolve_cover_art_url(candidate.as_deref()).await;
+                        // so fall back to Last.fm's own track/album art — retrying with the
+                        // leading artist of a multi-artist credit, since Last.fm often
+                        // only serves the album image under that. The secondary source is
+                        // reached even when the primary is a cached miss; that miss only
+                        // says the primary url is dead, not that Last.fm has nothing.
+                        // Repeats stay cheap: the API calls are cached and the resolved
+                        // url is cached too.
+                        album_art_url = api_requester::resolve_cover_art_fallback(
+                            &user.account_username,
+                            &user.api_type(),
+                            tracks[0].name.as_str(),
+                            tracks[0].artist.as_str(),
+                            tracks[0].album.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }

@@ -428,6 +428,61 @@ async fn probe_cover_art(url: &str) -> Option<String> {
     None
 }
 
+/// First artist of a multi-artist credit ("A, B, C" -> "A"), else the whole name.
+pub fn leading_artist(artist: &str) -> &str {
+    artist
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(artist)
+}
+
+/// Resolve cover art for a track from Last.fm's track/album art (the primary url is
+/// resolved by the caller). Last.fm often only serves an album's image under the *leading*
+/// artist of a multi-artist credit, so the album lookup retries with that artist when the
+/// full credit returns nothing usable.
+pub async fn resolve_cover_art_fallback(
+    username: &str,
+    api_type: &ApiType,
+    track: &str,
+    artist: &str,
+    album: Option<&str>,
+) -> Option<String> {
+    if api_type == &ApiType::Librefm {
+        return None;
+    }
+
+    let Ok(track_info) = fetch_lastfm_track(
+        Some(username.to_string()),
+        artist.to_string(),
+        track.to_string(),
+    )
+    .await
+    else {
+        return None;
+    };
+
+    let mut candidate = track_info.album_art_url;
+
+    if candidate.is_none() && let Some(album) = album {
+        if let Ok(album_info) = fetch_lastfm_album(username, artist, album).await {
+            candidate = album_info.album_art_url;
+        }
+        if candidate.is_none() {
+            let first = leading_artist(artist);
+            if first != artist {
+                candidate = fetch_lastfm_album(username, first, album)
+                    .await
+                    .ok()
+                    .and_then(|a| a.album_art_url);
+            }
+        }
+    }
+
+    resolve_cover_art_url(candidate.as_deref()).await
+}
+
 /// Confirm a cover art url really serves an image, returning the preferred size that does.
 ///
 /// ListenBrainz gives us a release mbid even when the Cover Art Archive holds no art for
@@ -1612,6 +1667,14 @@ mod tests {
     fn cache_key_for_unknown_host_is_the_url() {
         let url = "https://example.com/cover.png";
         assert_eq!(cover_art_cache_key(url), url);
+    }
+
+    #[test]
+    fn leading_artist_splits_multi_artist_credits() {
+        assert_eq!(leading_artist("Ele A, NeS"), "Ele A");
+        assert_eq!(leading_artist("Gmtn., kozato, Luze"), "Gmtn.");
+        assert_eq!(leading_artist("Single Artist"), "Single Artist");
+        assert_eq!(leading_artist("Massive New Krew"), "Massive New Krew");
     }
 
     // Network-gated: `cargo test -- --ignored`. These pin the exact behaviour that broke
