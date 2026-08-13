@@ -524,6 +524,45 @@ pub async fn resolve_cover_art_fallback(
     resolve_cover_art_url(candidate.as_deref()).await
 }
 
+/// Resolve Cover Art Archive art from the release's JSON metadata instead of HEAD-probing
+/// the (flaky) archive.org redirect chain. The JSON is served straight by CAA and lists
+/// the front thumbnail URLs directly.
+async fn resolve_caa_json(mbid: &str) -> ProbeOutcome {
+    let url = format!("https://coverartarchive.org/release/{mbid}");
+    let Ok(response) = CLIENT_PROBE.get(&url).send().await else {
+        return ProbeOutcome::Unknown;
+    };
+    let status = response.status();
+    if status.is_server_error() {
+        return ProbeOutcome::Unknown;
+    }
+    if !status.is_success() {
+        // 404 etc - definitively no art.
+        return ProbeOutcome::NoArt;
+    }
+    let Ok(json) = response.json::<serde_json::Value>().await else {
+        return ProbeOutcome::Unknown;
+    };
+
+    let front = json["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|img| img["front"].as_bool() == Some(true));
+
+    if let Some(front) = front {
+        for size in ["500", "250", "1200"] {
+            if let Some(u) = front["thumbnails"][size].as_str() {
+                return ProbeOutcome::Image(u.to_string());
+            }
+        }
+        if let Some(u) = front["image"].as_str() {
+            return ProbeOutcome::Image(u.to_string());
+        }
+    }
+    ProbeOutcome::NoArt
+}
+
 /// Confirm a cover art url really serves an image, returning the preferred size that does.
 ///
 /// ListenBrainz gives us a release mbid even when the Cover Art Archive holds no art for
@@ -542,7 +581,14 @@ pub async fn resolve_cover_art_url(url: Option<&str>) -> Option<String> {
         None => {}
     }
 
-    let outcome = probe_cover_art(url).await;
+    let outcome = if let Some(mbid) = url
+        .split_once("coverartarchive.org/release/")
+        .and_then(|(_, rest)| rest.split('/').next())
+    {
+        resolve_caa_json(mbid).await
+    } else {
+        probe_cover_art(url).await
+    };
 
     match outcome {
         ProbeOutcome::Image(resolved) => {
@@ -733,36 +779,50 @@ pub async fn fetch_lastfm_track(
 
 pub async fn fetch_listenbrainz_track_playcount(
     username: &str,
-    artist: &str,
-    track: &str,
+    _artist: &str,
+    _track: &str,
     recording_mbid: Option<&str>,
 ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(&ApiType::Listenbrainz);
-    let url = format!("{base_url}stats/user/{username}/recordings?range=all_time&count=1000");
+    // The stats endpoint only covers the user's top-1000 recordings, so any track outside
+    // that window reports 0. Count the real listens instead: page through /listens filtered
+    // by recording mbid. Tracks under 100 plays cost a single request.
+    let Some(recording_mbid) = recording_mbid else {
+        return Ok(0);
+    };
+
     let t0 = std::time::Instant::now();
-    let response = CLIENT.get(&url).send().await?;
-    let json = response.json::<serde_json::Value>().await?;
-    log::debug!("api: LB playcount took {:?}", t0.elapsed());
+    let mut total: u64 = 0;
+    let mut max_ts: Option<i64> = None;
 
-    let user_playcount = json["payload"]["recordings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|recording| {
-            // ListenBrainz formats the artist credit differently between the live listen and
-            // the stats endpoint (e.g. "Gmtn., kozato, Luze" vs "gmtn. vs. kozato (fw. LUZE)"),
-            // so match on recording_mbid when we have it and only fall back to name matching.
-            if let Some(recording_mbid) = recording_mbid {
-                recording["recording_mbid"].as_str() == Some(recording_mbid)
-            } else {
-                recording["artist_name"].as_str().unwrap_or_default().eq_ignore_ascii_case(artist)
-                    && recording["track_name"].as_str().unwrap_or_default().eq_ignore_ascii_case(track)
-            }
-        })
-        .and_then(|recording| recording["listen_count"].as_u64())
-        .unwrap_or_default();
+    loop {
+        let base = format!(
+            "https://api.listenbrainz.org/1/user/{username}/listens?count=100&recording_mbid={recording_mbid}"
+        );
+        let url = match max_ts {
+            Some(ts) => format!("{base}&max_ts={ts}"),
+            None => base,
+        };
+        let response = CLIENT.get(&url).send().await?;
+        let json = response.json::<serde_json::Value>().await?;
+        let listens = json["payload"]["listens"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let n = listens.len();
+        total += n as u64;
 
-    Ok(user_playcount)
+        if n < 100 {
+            break;
+        }
+        // Page backwards past the oldest listen in this page.
+        max_ts = listens
+            .last()
+            .and_then(|l| l["listened_at"].as_i64())
+            .map(|t| t - 1);
+    }
+
+    log::debug!("api: LB playcount took {:?} (count={total})", t0.elapsed());
+    Ok(total)
 }
 
 pub async fn fetch_lastfm_album(
