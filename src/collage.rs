@@ -8,6 +8,7 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 
 use crate::api_requester::{Album, CLIENT_NOCACHE, cover_art_candidates};
+use crate::navidrome;
 use crate::config;
 
 const FONT_SIZE: f32 = 24.0;
@@ -22,7 +23,27 @@ pub const MIN_SIZE: u32 = 1;
 //
 // The url we were given is tried first: tiles are only TILE_PX wide, so there is nothing
 // to gain from pulling a larger variant when the size that came with the url works.
-async fn fetch_album_art(url: String) -> Result<Bytes, anyhow::Error> {
+async fn fetch_album_art(album: Album, username: String) -> Result<Bytes, anyhow::Error> {
+    let url = match album.album_art_url {
+        Some(url) => url,
+        None => return Err(anyhow!("no cover art url")),
+    };
+
+    // Gated users get Navidrome art first: release mbid -> Navidrome album -> local
+    // cover, skipping the CAA round trip entirely. Navidrome answers a placeholder
+    // image for albums without art; the resolver detects it and falls back to CAA.
+    if navidrome::enabled_for(&username) {
+        if let Some(release_mbid) = &album.release_mbid {
+            if let Some(cover_url) = navidrome::resolve_cover_art_release(release_mbid).await
+                && let Some(bytes) = crate::api_requester::cover_art_bytes(Some(&cover_url)).await
+                && !bytes.is_empty()
+            {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    // Fall back to CAA (or whatever url the api handed back).
     let mut last_err = anyhow!("no cover art url");
 
     let candidates = std::iter::once(url.clone())
@@ -42,13 +63,16 @@ async fn fetch_album_art(url: String) -> Result<Bytes, anyhow::Error> {
     Err(last_err)
 }
 
-async fn fetch_album_arts(albums: &[&Album]) -> Vec<Result<Bytes, anyhow::Error>> {
+async fn fetch_album_arts(
+    albums: &[&Album],
+    username: &str,
+) -> Vec<Result<Bytes, anyhow::Error>> {
     let mut handles = Vec::new();
     albums
         .iter()
-        .map(|album| album.album_art_url.clone().unwrap())
-        .for_each(|url| {
-            let handle = tokio::spawn(fetch_album_art(url));
+        .map(|album| ((*album).clone(), username.to_string()))
+        .for_each(|(album, username)| {
+            let handle = tokio::spawn(fetch_album_art(album, username));
             handles.push(handle);
         });
 
@@ -65,6 +89,7 @@ pub async fn create_collage(
     albums: &[Album],
     size: u32,
     text: bool,
+    username: &str,
 ) -> Result<Vec<u8>, anyhow::Error> {
     static FONT: LazyLock<FontVec> = LazyLock::new(|| {
         let font_data = std::fs::read(config::FONT_FILE_PATH).expect("Failed to read font file");
@@ -81,7 +106,7 @@ pub async fn create_collage(
         .take((size * size).try_into().unwrap())
         .collect::<Vec<_>>();
 
-    let tiles_bytes_vec = fetch_album_arts(&albums).await;
+    let tiles_bytes_vec = fetch_album_arts(&albums, username).await;
 
     for (i, album) in albums.iter().enumerate() {
         let tiles_bytes = &tiles_bytes_vec[i];

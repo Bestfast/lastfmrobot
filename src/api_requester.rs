@@ -28,7 +28,7 @@ pub struct Track {
     pub release_group_mbid: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Album {
     pub name: String,
     pub artist: String,
@@ -37,6 +37,7 @@ pub struct Album {
     pub listeners: u64,
     pub user_playcount: u64,
     pub tags: Option<Vec<String>>,
+    pub release_mbid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -195,6 +196,41 @@ pub static CLIENT_NOCACHE: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
             .unwrap(),
     )
     .with(Response200Middleware {})
+    .build()
+});
+
+// ListenBrainz gets a tighter timeout (10s) than the shared client — it's the
+// most frequently down/glitchy service and a slow answer shouldn't stall a status.
+pub static CLIENT_LB: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
+    ClientBuilder::new(
+        reqwest::ClientBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .https_only(true)
+            .user_agent("LastFM Robot (Telegram bot)")
+            .build()
+            .unwrap(),
+    )
+    .with(Response200Middleware {})
+    .with(ForceCacheMiddleware {})
+    .with(Cache(HttpCache {
+        mode: CacheMode::Default,
+        manager: MokaManager::new(
+            moka::future::Cache::builder()
+                .max_capacity(100)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+        ),
+        options: http_cache_reqwest::HttpCacheOptions {
+            cache_options: CacheOptions {
+                shared: false,
+                immutable_min_time_to_live: Duration::from_secs(300),
+                ignore_cargo_cult: true,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+    }))
     .build()
 });
 
@@ -644,6 +680,18 @@ pub async fn cover_art_bytes(url: Option<&str>) -> Option<bytes::Bytes> {
     Some(bytes)
 }
 
+/// Warm the in-memory cover bytes cache from bytes already fetched by a caller (e.g. the
+/// Navidrome resolver), so a later `cover_art_bytes` call hits memory instead of
+/// downloading again.
+pub fn cache_cover_art_bytes(url: &str, bytes: bytes::Bytes) {
+    if !bytes.is_empty() && bytes.len() <= 10 * 1024 * 1024 {
+        let url = url.to_string();
+        tokio::spawn(async move {
+            COVER_ART_BYTES_CACHE.insert(url, bytes).await;
+        });
+    }
+}
+
 fn get_base_url(api_type: &ApiType) -> &'static str {
     match api_type {
         ApiType::Lastfm => "https://ws.audioscrobbler.com/2.0/",
@@ -786,7 +834,7 @@ pub async fn fetch_listenbrainz_track_playcount(
     let base_url = get_base_url(&ApiType::Listenbrainz);
     let url = format!("{base_url}stats/user/{username}/recordings?range=all_time&count=1000");
     let t0 = std::time::Instant::now();
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
     log::debug!("api: LB playcount took {:?}", t0.elapsed());
 
@@ -878,6 +926,7 @@ pub async fn fetch_lastfm_album(
         user_playcount,
         album_art_url: get_biggest_lastfm_image(&json["album"]),
         tags: Some(tags),
+        release_mbid: None,
     })
 }
 
@@ -1122,7 +1171,7 @@ async fn fetch_loved_tracks_listenbrainz(username: &str) -> Result<Vec<Track>, B
     let base_url = get_base_url(&ApiType::Listenbrainz);
     let url = format!("{base_url}user/{username}/get-feedback?metadata=true&count=5");
 
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
 
     parse_listenbrainz_tracks(&json["feedback"])
@@ -1202,7 +1251,7 @@ async fn fetch_albums_listenbrainz(
         duration_str,
         limit.unwrap_or(100)
     );
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
 
@@ -1228,6 +1277,7 @@ async fn fetch_albums_listenbrainz(
                 .or_else(|| album_json["release_mbid"].as_str())
                 .map(caa_front_url_largest);
             let user_playcount = album_json["listen_count"].as_u64().unwrap_or_default();
+            let release_mbid = album_json["release_mbid"].as_str().map(str::to_string);
 
             Album {
                 name,
@@ -1237,6 +1287,7 @@ async fn fetch_albums_listenbrainz(
                 playcount: 0,
                 user_playcount,
                 tags: None,
+                release_mbid,
             }
         })
         .collect::<Vec<_>>();
@@ -1290,6 +1341,7 @@ async fn fetch_albums_lastfm(
                 playcount: 0,
                 user_playcount,
                 tags: None,
+                release_mbid: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1330,7 +1382,7 @@ async fn fetch_artists_listenbrainz(
         time_period_to_api_string(duration, &ApiType::Listenbrainz),
         limit.unwrap_or(100)
     );
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
 
@@ -1437,7 +1489,7 @@ async fn fetch_tracks_listenbrainz(
         time_period_to_api_string(duration, &ApiType::Listenbrainz),
         limit.unwrap_or(100)
     );
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
 
@@ -1529,26 +1581,26 @@ async fn fetch_user_info_listenbrainz(username: &str) -> Result<ScrobbleUser, Bo
     let base_url = get_base_url(&ApiType::Listenbrainz);
 
     let url = format!("{base_url}user/{username}/listen-count");
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
     let playcount = json["payload"]["count"].as_u64().unwrap_or_default();
 
     let url = format!("{base_url}stats/user/{username}/artists");
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
     let artist_count = json["payload"]["total_artist_count"]
         .as_u64()
         .unwrap_or_default();
 
     let url = format!("{base_url}stats/user/{username}/releases");
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
     let track_count = json["payload"]["total_release_count"]
         .as_u64()
         .unwrap_or_default();
 
     let url = format!("{base_url}stats/user/{username}/recordings");
-    let response = CLIENT.get(&url).send().await?;
+    let response = CLIENT_LB.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
     let album_count = json["payload"]["total_recording_count"]
         .as_u64()

@@ -3,5 +3,19 @@ pub const LASTFM_API_KEY: &str = "";
 pub const OWNER_ID: &str = "";
 pub const INLINE_IMAGES_DUMP_CHAT_ID: &str = "";
 pub const AMPLITUDE_KEY: &str = "";
+// Navidrome as an alternative cover art source. Only users in NAVIDROME_USERS
+// (matched by scrobbling username, e.g. "Bestfast") get covers resolved from your
+// Navidrome first (mbid-tagged library -> fast local art instead of Cover Art
+// Archive). Leave NAVIDROME_URL empty to disable.
+pub const NAVIDROME_URL: &str = "";
+pub const NAVIDROME_USERNAME: &str = "";
+pub const NAVIDROME_PASSWORD: &str = "";
+pub const NAVIDROME_USERS: &[&str] = &["Bestfast"];
+// SHA-256 (lowercase hex) of Navidrome's embedded `album-placeholder.webp`. A cover
+// served with these exact bytes is a placeholder (album has no art), so the bot falls
+// back to CAA/Last.fm instead. Changes between Navidrome versions — regenerate from
+// `resources/album-placeholder.webp` in the matching Navidrome release when upgrading.
+// Empty disables the check (everything from Navidrome is trusted as real art).
+pub const NAVIDROME_PLACEHOLDER_SHA256: &str = "";
 // get one from https://github.com/notofonts/noto-cjk or something and put the path relative to the root dir of the project
 pub const FONT_FILE_PATH: &str = "NotoSansCJK-Medium.ttc";

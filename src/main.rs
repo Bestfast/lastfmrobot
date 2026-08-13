@@ -34,6 +34,7 @@ mod collage;
 mod config;
 mod consts;
 mod db;
+mod navidrome;
 mod utils;
 
 type Bot = Throttle<teloxide::Bot>;
@@ -176,12 +177,6 @@ async fn message_handler(bot: Bot, msg: Message) -> Result<(), Box<dyn Error + S
         if from.is_none() {
             return Ok(());
         }
-
-        log::debug!(
-            "message from {} ({}): {text}",
-            from.unwrap().id.0,
-            from.unwrap().first_name
-        );
 
         if from.unwrap().is_anonymous() {
             utils::send_or_edit_message(&bot, consts::ANON_KUN, None, None, false, None, true)
@@ -538,7 +533,12 @@ async fn status_command(
                 if user.api_type() == ApiType::Listenbrainz {
                     // Resolve the cover and fetch the play count concurrently — both are
                     // network calls, no reason to wait for them one after the other.
-                    let resolve_fut = api_requester::resolve_cover_art_url(
+                    // Gated users resolve from Navidrome first (mbid -> local art),
+                    // falling back to CAA when Navidrome has no album.
+                    let resolve_fut = navidrome::resolve_cover_art_or_fallback(
+                        &user.account_username,
+                        tracks[0].release_group_mbid.as_deref(),
+                        tracks[0].release_mbid.as_deref(),
                         tracks[0].album_art_url.as_deref(),
                     );
                     let playcount_fut = api_requester::fetch_listenbrainz_track_playcount(
@@ -573,9 +573,17 @@ async fn status_command(
                 let artist = tracks[0].artist.clone();
                 let track_name = tracks[0].name.clone();
                 let album = tracks[0].album.clone();
+                let release_group_mbid = tracks[0].release_group_mbid.clone();
+                let release_mbid = tracks[0].release_mbid.clone();
                 tokio::spawn(async move {
                     let start = std::time::Instant::now();
-                    let mut resolved = api_requester::resolve_cover_art_url(Some(&url)).await;
+                    let mut resolved = navidrome::resolve_cover_art_or_fallback(
+                        &account_username,
+                        release_group_mbid.as_deref(),
+                        release_mbid.as_deref(),
+                        Some(&url),
+                    )
+                    .await;
 
                     if resolved.is_none() {
                         resolved = api_requester::resolve_cover_art_fallback(
@@ -695,6 +703,8 @@ async fn status_command(
             if let Some(url) = &album_art_url {
                 art_src = if url.contains("coverartarchive.org") {
                     'c'
+                } else if url.contains("getCoverArt") {
+                    'd'
                 } else if url.contains("lastfm") {
                     'l'
                 } else {
@@ -1235,7 +1245,7 @@ async fn collage_command(
         api_requester::fetch_albums(&user.account_username, &period, &user.api_type(), None).await;
     match albums {
         Ok(albums) => {
-            let img = collage::create_collage(&albums, size, !no_text).await;
+            let img = collage::create_collage(&albums, size, !no_text, &user.account_username).await;
             match img {
                 Ok(img) => {
                     let period_str = period.to_string();
@@ -2066,6 +2076,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
             };
             let art_txt = match art {
                 'c' => "Cover Art Archive (MusicBrainz)",
+                'd' => "Navidrome",
                 'l' => "Last.fm",
                 'n' => "none",
                 _ => "unknown",
