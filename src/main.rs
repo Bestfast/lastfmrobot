@@ -504,7 +504,7 @@ async fn status_command(
     )
     .await;
 
-    log::info!("status: fetch_recent_tracks took {:?}", started.elapsed());
+    log::debug!("status: fetch_recent_tracks took {:?}", started.elapsed());
 
     match tracks {
         Ok(tracks) => {
@@ -556,7 +556,7 @@ async fn status_command(
                     )
                     .await;
                 }
-                log::info!(
+                log::debug!(
                     "status: cover resolve took {:?} (resolved={}, total {:?})",
                     cover_start.elapsed(),
                     album_art_url.is_some(),
@@ -606,7 +606,7 @@ async fn status_command(
                     if let Some(resolved) = &resolved {
                         let _ = api_requester::cover_art_bytes(Some(resolved)).await;
                     }
-                    log::info!(
+                    log::debug!(
                         "status: bg cover warm took {:?} (resolved={})",
                         start.elapsed(),
                         resolved.is_some()
@@ -853,7 +853,7 @@ async fn status_command(
                     false,
                 )
                 .await?;
-                log::info!(
+                log::debug!(
                     "status: photo send took {:?} (total {:?})",
                     send_start.elapsed(),
                     started.elapsed()

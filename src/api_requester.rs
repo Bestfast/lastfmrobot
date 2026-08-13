@@ -419,11 +419,11 @@ async fn probe_cover_art(url: &str) -> Option<String> {
     let t0 = std::time::Instant::now();
     for handle in handles {
         if let Ok((candidate, true)) = handle.await {
-            log::info!("api: cover probe found after {:?}", t0.elapsed());
+            log::debug!("api: cover probe found after {:?}", t0.elapsed());
             return Some(candidate);
         }
     }
-    log::info!("api: cover probe all missed after {:?}", t0.elapsed());
+    log::debug!("api: cover probe all missed after {:?}", t0.elapsed());
 
     None
 }
@@ -540,7 +540,7 @@ pub async fn fetch_lastfm_track(
     let response = CLIENT.get(url?).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
-    log::info!("api: track.getInfo took {:?}", t0.elapsed());
+    log::debug!("api: track.getInfo took {:?}", t0.elapsed());
     let track_json = json["track"].as_object();
     if track_json.is_none() {
         return Err(Box::from("Track not found."));
@@ -632,7 +632,7 @@ pub async fn fetch_listenbrainz_track_playcount(
     let t0 = std::time::Instant::now();
     let response = CLIENT.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
-    log::info!("api: LB playcount took {:?}", t0.elapsed());
+    log::debug!("api: LB playcount took {:?}", t0.elapsed());
 
     let user_playcount = json["payload"]["recordings"]
         .as_array()
@@ -676,7 +676,7 @@ pub async fn fetch_lastfm_album(
     let response = CLIENT.get(url?).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
-    log::info!("api: album.getInfo took {:?}", t0.elapsed());
+    log::debug!("api: album.getInfo took {:?}", t0.elapsed());
     let album_json = json["album"].as_object();
     if album_json.is_none() {
         return Err(Box::from("Album not found."));
