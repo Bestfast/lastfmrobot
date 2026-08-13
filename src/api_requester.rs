@@ -24,6 +24,8 @@ pub struct Track {
     pub now_playing: bool,
     pub tags: Option<Vec<String>>,
     pub recording_mbid: Option<String>,
+    pub release_mbid: Option<String>,
+    pub release_group_mbid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -196,6 +198,90 @@ pub static CLIENT_NOCACHE: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
     .build()
 });
 
+// MusicBrainz requires a descriptive User-Agent (with contact info) or it answers 403.
+// Responses are cached like the other clients; genres are effectively immutable.
+static CLIENT_MB: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
+    ClientBuilder::new(
+        reqwest::ClientBuilder::new()
+            .timeout(Duration::from_secs(15))
+            .https_only(true)
+            .user_agent("lastfmrobot/0.2 (+https://github.com/Bestfast/lastfmrobot)")
+            .build()
+            .unwrap(),
+    )
+    .with(Response200Middleware {})
+    .with(ForceCacheMiddleware {})
+    .with(Cache(HttpCache {
+        mode: CacheMode::Default,
+        manager: MokaManager::new(
+            moka::future::Cache::builder()
+                .max_capacity(500)
+                .time_to_live(Duration::from_secs(6 * 60 * 60))
+                .build(),
+        ),
+        options: http_cache_reqwest::HttpCacheOptions {
+            cache_options: CacheOptions {
+                shared: false,
+                immutable_min_time_to_live: Duration::from_secs(6 * 60 * 60),
+                ignore_cargo_cult: true,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+    }))
+    .build()
+});
+
+/// MusicBrainz genres for a track, tried release-group → recording → release (release
+/// groups carry genres most often). ListenBrainz tracks carry these mbids, which makes
+/// this the natural tag source; Last.fm's track-level toptags no longer exist. MB is
+/// rate-limited, so failures (429/503) fall through to None and the caller falls back.
+pub async fn fetch_mb_genres(
+    recording_mbid: Option<&str>,
+    release_group_mbid: Option<&str>,
+    release_mbid: Option<&str>,
+) -> Option<Vec<String>> {
+    for mbid in [
+        release_group_mbid.map(|m| format!("release-group/{m}")),
+        recording_mbid.map(|m| format!("recording/{m}")),
+        release_mbid.map(|m| format!("release/{m}")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let url = format!("https://musicbrainz.org/ws/2/{mbid}?inc=genres+tags&fmt=json");
+        let Ok(response) = CLIENT_MB.get(&url).send().await else {
+            continue;
+        };
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            continue;
+        };
+
+        let genres: Vec<String> = json["genres"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g["name"].as_str().map(str::to_string))
+            .collect();
+        if !genres.is_empty() {
+            return Some(genres);
+        }
+
+        let tags: Vec<String> = json["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        if !tags.is_empty() {
+            return Some(tags);
+        }
+    }
+
+    None
+}
+
 type BoxError = Box<dyn Error + Send + Sync>;
 
 // ListenBrainz goes down fairly often and its stats endpoints lag behind fresh listens.
@@ -222,12 +308,13 @@ async fn or_lastfm<T>(
 
 // Cover Art Archive serves the original upload at `/front` plus fixed thumbnails at
 // `/front-250`, `/front-500` and `/front-1200` — those are the only sizes that exist.
-// We prefer 1200 (the largest thumbnail) over the original because originals are
-// unbounded: lossless scans of several MB are common, and Telegram rejects photos sent
-// by URL above 10MB. CAA answers 307 for every size without checking, so a missing
-// thumbnail only surfaces as a 404 from archive.org once the redirect is followed —
-// hence the step-down list rather than a single URL.
-pub const CAA_SIZES: [u16; 3] = [1200, 500, 250];
+// We prefer 500 (plenty sharp for Telegram, a fraction of the download) and step down to
+// 250; only if neither exists do we fall back to 1200. The original `/front` is avoided
+// on purpose: originals are unbounded — lossless scans of several MB are common, and
+// Telegram rejects photos sent by URL above 10MB. CAA answers 307 for every size without
+// checking, so a missing thumbnail only surfaces as a 404 from archive.org once the
+// redirect is followed — hence the step-down list rather than a single URL.
+pub const CAA_SIZES: [u16; 3] = [500, 250, 1200];
 
 pub fn caa_front_url(mbid: &str, size: u16) -> String {
     format!("https://coverartarchive.org/release/{mbid}/front-{size}")
@@ -248,9 +335,10 @@ pub fn caa_front_url_with_size(url: &str, size: u16) -> Option<String> {
 // Last.fm serves every image at a fixed set of sizes under `/i/u/<size>/<hash>`, and the
 // size its api hands back (`300x300` for the largest entry of an `image` array) is not
 // always one that was actually generated — the cdn answers those with a 404 html page,
-// the same thing Telegram chokes on. So Last.fm urls get a step-down list too. `770x0` is
-// the largest size on offer and stays far below Telegram's 10MB limit for photos by url.
-pub const LASTFM_IMAGE_SIZES: [&str; 6] = ["770x0", "500x500", "300x300", "174s", "64s", "34s"];
+// the same thing Telegram chokes on. So Last.fm urls get a step-down list too, preferring
+// `500x500` and going smaller before the largest (`770x0`) as a last resort. Every size
+// stays far below Telegram's 10MB limit for photos by url.
+pub const LASTFM_IMAGE_SIZES: [&str; 6] = ["500x500", "300x300", "174s", "64s", "34s", "770x0"];
 
 /// Rewrite a Last.fm image URL to a different size, leaving other URLs untouched.
 pub fn lastfm_image_url_with_size(url: &str, size: &str) -> Option<String> {
@@ -280,33 +368,124 @@ pub fn cover_art_candidates(url: &str) -> Vec<String> {
     }
 }
 
-/// Confirm a cover art url really serves an image, returning the largest size that does.
+// Confirming a cover art url costs a round trip per candidate. The confirmation is kept
+// in a persistent cache (users.sqlite, 6h TTL, see db.rs) so repeated statuses — and
+// restarts — skip the probing entirely. Entries are keyed on the *canonical* image
+// (CAA release mbid or the Last.fm image hash), so a hit works no matter which size
+// variant the API happened to hand back.
+fn cover_art_cache_key(url: &str) -> String {
+    if let Some(mbid) = url
+        .split_once("coverartarchive.org/release/")
+        .and_then(|(_, rest)| rest.split('/').next())
+    {
+        return format!("caa:{mbid}");
+    }
+    if let Some(file) = lastfm_image_url_with_size(url, "x").and_then(|u| {
+        u.rsplit('/').next().map(str::to_string)
+    }) {
+        return format!("lf:{file}");
+    }
+    url.to_string()
+}
+
+async fn probe_one(candidate: String) -> bool {
+    // Response200Middleware turns CAA's 404 into an error, so a response here is already
+    // 2xx; the content type still has to be checked in case a host answers 200 with an
+    // error page.
+    let Ok(response) = CLIENT_NOCACHE.head(&candidate).send().await else {
+        return false;
+    };
+
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.starts_with("image/"))
+}
+
+/// Probe every candidate size at once — a miss then costs one round trip instead of one
+/// per size — and return the first (most preferred) size that actually serves an image.
+async fn probe_cover_art(url: &str) -> Option<String> {
+    let candidates = cover_art_candidates(url);
+
+    let mut handles = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let candidate = candidate.clone();
+        handles.push(tokio::task::spawn(async move {
+            (candidate.clone(), probe_one(candidate).await)
+        }));
+    }
+
+    let t0 = std::time::Instant::now();
+    for handle in handles {
+        if let Ok((candidate, true)) = handle.await {
+            log::info!("api: cover probe found after {:?}", t0.elapsed());
+            return Some(candidate);
+        }
+    }
+    log::info!("api: cover probe all missed after {:?}", t0.elapsed());
+
+    None
+}
+
+/// Confirm a cover art url really serves an image, returning the preferred size that does.
 ///
 /// ListenBrainz gives us a release mbid even when the Cover Art Archive holds no art for
 /// it, and CAA answers those with a 404 *html* page. Handing that to Telegram fails the
 /// send with "wrong type of the web page content", so the url has to be checked here
 /// rather than trusted. Returning None lets the caller fall back to the placeholder.
+/// Results are cached in users.sqlite for 6 hours.
 pub async fn resolve_cover_art_url(url: Option<&str>) -> Option<String> {
-    for candidate in cover_art_candidates(url?) {
-        // Response200Middleware turns CAA's 404 into an error, so a response here is
-        // already 2xx; the content type still has to be checked in case a host answers
-        // 200 with an error page.
-        let Ok(response) = CLIENT_NOCACHE.head(&candidate).send().await else {
-            continue;
-        };
+    let url = url?;
+    let key = cover_art_cache_key(url);
 
-        let is_image = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|content_type| content_type.starts_with("image/"));
-
-        if is_image {
-            return Some(candidate);
-        }
+    let cached = crate::db::DB.lock().unwrap().get_cover_art(&key);
+    match cached {
+        Some(Some(resolved)) => return Some(resolved),
+        Some(None) => return None,
+        None => {}
     }
 
-    None
+    let resolved = probe_cover_art(url).await;
+
+    crate::db::DB
+        .lock()
+        .unwrap()
+        .store_cover_art(&key, resolved.as_deref())
+        .ok();
+
+    resolved
+}
+
+// The image bytes behind a resolved cover url, cached in memory. Keyed on the resolved
+// url, 6h TTL. Warming these in the background lets a cover click upload bytes straight
+// to Telegram instead of making Telegram fetch the image from the (often slow) CDN.
+static COVER_ART_BYTES_CACHE: LazyLock<moka::future::Cache<String, bytes::Bytes>> =
+    LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(256)
+            .time_to_live(Duration::from_secs(6 * 60 * 60))
+            .build()
+    });
+
+/// The image bytes for a cover art url, or None when they can't be fetched. The caller is
+/// expected to pass a *resolved* url; a cache hit returns instantly, a miss downloads
+/// once and warms the cache. Oversized responses are rejected.
+pub async fn cover_art_bytes(url: Option<&str>) -> Option<bytes::Bytes> {
+    let url = url?;
+    if let Some(bytes) = COVER_ART_BYTES_CACHE.get(url).await {
+        return Some(bytes);
+    }
+
+    let Ok(response) = CLIENT_NOCACHE.get(url).send().await else {
+        return None;
+    };
+    let bytes = response.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+        return None;
+    }
+    COVER_ART_BYTES_CACHE.insert(url.to_string(), bytes.clone()).await;
+    Some(bytes)
 }
 
 fn get_base_url(api_type: &ApiType) -> &'static str {
@@ -357,9 +536,11 @@ pub async fn fetch_lastfm_track(
         ],
     );
 
+    let t0 = std::time::Instant::now();
     let response = CLIENT.get(url?).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
+    log::info!("api: track.getInfo took {:?}", t0.elapsed());
     let track_json = json["track"].as_object();
     if track_json.is_none() {
         return Err(Box::from("Track not found."));
@@ -435,6 +616,8 @@ pub async fn fetch_lastfm_track(
         now_playing: false,
         tags,
         recording_mbid: None,
+        release_mbid: None,
+        release_group_mbid: None,
     })
 }
 
@@ -446,8 +629,10 @@ pub async fn fetch_listenbrainz_track_playcount(
 ) -> Result<u64, Box<dyn Error + Send + Sync>> {
     let base_url = get_base_url(&ApiType::Listenbrainz);
     let url = format!("{base_url}stats/user/{username}/recordings?range=all_time&count=1000");
+    let t0 = std::time::Instant::now();
     let response = CLIENT.get(&url).send().await?;
     let json = response.json::<serde_json::Value>().await?;
+    log::info!("api: LB playcount took {:?}", t0.elapsed());
 
     let user_playcount = json["payload"]["recordings"]
         .as_array()
@@ -487,9 +672,11 @@ pub async fn fetch_lastfm_album(
             ("format", "json"),
         ],
     );
+    let t0 = std::time::Instant::now();
     let response = CLIENT.get(url?).send().await?;
 
     let json = response.json::<serde_json::Value>().await?;
+    log::info!("api: album.getInfo took {:?}", t0.elapsed());
     let album_json = json["album"].as_object();
     if album_json.is_none() {
         return Err(Box::from("Album not found."));
@@ -538,65 +725,6 @@ pub async fn fetch_lastfm_album(
     })
 }
 
-pub async fn fetch_lastfm_artist(
-    username: Option<String>,
-    artist: String,
-) -> Result<Artist, Box<dyn Error + Send + Sync>> {
-    let base_url = get_base_url(&ApiType::Lastfm);
-    let url = Url::parse_with_params(
-        base_url,
-        &[
-            ("method", "artist.getInfo"),
-            ("artist", artist.as_str()),
-            ("user", username.unwrap_or_default().as_str()),
-            ("api_key", config::LASTFM_API_KEY),
-            ("format", "json"),
-        ],
-    );
-    let response = CLIENT.get(url?).send().await?;
-
-    let json = response.json::<serde_json::Value>().await?;
-    let artist_json = json["artist"].as_object();
-    if artist_json.is_none() {
-        return Err(Box::from("Artist not found."));
-    }
-    let artist_json = artist_json.unwrap();
-    let name = artist_json["name"].as_str().unwrap_or_default().to_string();
-    let listeners = artist_json["stats"]["listeners"]
-        .as_str()
-        .unwrap_or_default()
-        .parse::<u64>()
-        .unwrap_or_default();
-    let playcount = artist_json["stats"]["playcount"]
-        .as_str()
-        .unwrap_or_default()
-        .parse::<u64>()
-        .unwrap_or_default();
-    let user_playcount_obj = artist_json["stats"].get("userplaycount");
-    let user_playcount = if let Some(user_playcount_obj) = user_playcount_obj {
-        user_playcount_obj
-            .as_str()
-            .unwrap_or_default()
-            .parse::<u64>()
-            .unwrap_or_default()
-    } else {
-        0
-    };
-    let tags = artist_json["tags"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|x| x["name"].as_str().unwrap_or_default().to_string())
-        .collect::<Vec<_>>();
-
-    Ok(Artist {
-        name,
-        listeners,
-        playcount,
-        user_playcount,
-        tags: tags.into(),
-    })
-}
 
 pub fn parse_listenbrainz_tracks(
     json_arr: &Value,
@@ -640,6 +768,14 @@ pub fn parse_listenbrainz_tracks_np(
                 .or_else(|| track_metadata["additional_info"]["recording_mbid"].as_str())
                 .or_else(|| track_metadata["recording_mbid"].as_str())
                 .map(|s| s.to_string());
+            let release_mbid = track_metadata["mbid_mapping"]["release_mbid"]
+                .as_str()
+                .or_else(|| track_metadata["additional_info"]["release_mbid"].as_str())
+                .or_else(|| track_metadata["release_mbid"].as_str())
+                .map(|s| s.to_string());
+            let release_group_mbid = track_metadata["additional_info"]["release_group_mbid"]
+                .as_str()
+                .map(|s| s.to_string());
             let user_playcount = track_metadata["listen_count"].as_u64().unwrap_or_default();
             let date = track_json["listened_at"].as_u64();
 
@@ -657,6 +793,8 @@ pub fn parse_listenbrainz_tracks_np(
                 now_playing,
                 tags: None,
                 recording_mbid,
+                release_mbid,
+                release_group_mbid,
             }
         })
         .collect::<Vec<_>>();
@@ -716,6 +854,8 @@ pub fn parse_lastfm_tracks(json_arr: &Value) -> Result<Vec<Track>, Box<dyn Error
                 now_playing,
                 tags: None,
                 recording_mbid: None,
+                release_mbid: None,
+                release_group_mbid: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1199,6 +1339,8 @@ async fn fetch_tracks_lastfm(
                 user_loved: false,
                 tags: None,
                 recording_mbid: None,
+                release_mbid: None,
+                release_group_mbid: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1345,18 +1487,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn largest_url_uses_biggest_size() {
+    fn preferred_url_uses_500() {
         assert_eq!(
             caa_front_url_largest("abc"),
-            "https://coverartarchive.org/release/abc/front-1200"
+            "https://coverartarchive.org/release/abc/front-500"
         );
     }
 
     #[test]
-    fn sizes_are_ordered_largest_first() {
-        let mut sorted = CAA_SIZES;
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        assert_eq!(CAA_SIZES, sorted);
+    fn sizes_prefer_500_first() {
+        assert_eq!(CAA_SIZES[0], 500);
+        assert_eq!(CAA_SIZES.len(), 3);
     }
 
     #[test]
@@ -1388,14 +1529,14 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_largest_first_for_caa() {
+    fn candidates_prefer_500_for_caa() {
         let c = cover_art_candidates(&caa_front_url_largest("abc"));
         assert_eq!(
             c,
             vec![
-                "https://coverartarchive.org/release/abc/front-1200",
                 "https://coverartarchive.org/release/abc/front-500",
                 "https://coverartarchive.org/release/abc/front-250",
+                "https://coverartarchive.org/release/abc/front-1200",
             ]
         );
     }
@@ -1427,13 +1568,13 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_largest_first_for_lastfm() {
+    fn candidates_prefer_500_for_lastfm() {
         let c = cover_art_candidates("https://lastfm.freetls.fastly.net/i/u/300x300/abc.png");
         assert_eq!(c.len(), LASTFM_IMAGE_SIZES.len());
-        assert_eq!(c[0], "https://lastfm.freetls.fastly.net/i/u/770x0/abc.png");
+        assert_eq!(c[0], "https://lastfm.freetls.fastly.net/i/u/500x500/abc.png");
         assert_eq!(
             c.last().unwrap(),
-            "https://lastfm.freetls.fastly.net/i/u/34s/abc.png"
+            "https://lastfm.freetls.fastly.net/i/u/770x0/abc.png"
         );
     }
 
@@ -1441,6 +1582,36 @@ mod tests {
     fn candidates_for_unknown_host_are_just_the_url() {
         let url = "https://example.com/cover.png";
         assert_eq!(cover_art_candidates(url), vec![url]);
+    }
+
+    #[test]
+    fn cache_key_is_canonical_for_caa() {
+        assert_eq!(
+            cover_art_cache_key("https://coverartarchive.org/release/abc/front-500"),
+            "caa:abc"
+        );
+        assert_eq!(
+            cover_art_cache_key("https://coverartarchive.org/release/abc/front-1200"),
+            "caa:abc"
+        );
+    }
+
+    #[test]
+    fn cache_key_is_canonical_for_lastfm() {
+        assert_eq!(
+            cover_art_cache_key("https://lastfm.freetls.fastly.net/i/u/300x300/hash.png"),
+            "lf:hash.png"
+        );
+        assert_eq!(
+            cover_art_cache_key("https://lastfm.freetls.fastly.net/i/u/500x500/hash.png"),
+            "lf:hash.png"
+        );
+    }
+
+    #[test]
+    fn cache_key_for_unknown_host_is_the_url() {
+        let url = "https://example.com/cover.png";
+        assert_eq!(cover_art_cache_key(url), url);
     }
 
     // Network-gated: `cargo test -- --ignored`. These pin the exact behaviour that broke
@@ -1461,7 +1632,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn resolves_release_with_art_to_largest_size() {
+    async fn resolves_release_with_art_to_preferred_size() {
         let url = caa_front_url_largest("0d932a42-b3f5-419c-bc28-332d4a2b7f87");
         assert_eq!(resolve_cover_art_url(Some(&url)).await, Some(url));
     }
@@ -1475,7 +1646,7 @@ mod tests {
         let url = format!("https://lastfm.freetls.fastly.net/i/u/300x300/{hash}");
         assert_eq!(
             resolve_cover_art_url(Some(&url)).await,
-            Some(format!("https://lastfm.freetls.fastly.net/i/u/770x0/{hash}"))
+            Some(format!("https://lastfm.freetls.fastly.net/i/u/500x500/{hash}"))
         );
     }
 

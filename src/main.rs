@@ -4,11 +4,11 @@ use std::{
     error::Error,
     fs::File,
     io::{BufRead, BufReader},
-    sync::{LazyLock, Mutex, OnceLock},
+    sync::{LazyLock, OnceLock},
 };
 
 use api_requester::{ApiType, TimePeriod};
-use db::{Db, User};
+use db::{DB, User};
 use num_format::{Locale, ToFormattedString};
 use rand::seq::IndexedRandom;
 use reqwest::Url;
@@ -18,14 +18,13 @@ use teloxide::{
     payloads::SendMessageSetters,
     prelude::*,
     types::{
-        BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
+        BotCommand,         InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
         InlineQueryResultArticle, InlineQueryResultsButton, InlineQueryResultsButtonKind,
         InputFile, InputMediaPhoto, InputMessageContent, InputMessageContentText, Me,
-        MessageEntityKind, ParseMode, ReplyParameters,
+        ParseMode, ReplyParameters,
     },
     utils::command::BotCommands,
 };
-use tokio::task;
 use utils::choose_the_from;
 
 use crate::api_requester::EntryType;
@@ -84,9 +83,10 @@ enum Command {
     Help,
     #[command(description = "Priwacy powicy")]
     Privacy,
+    #[command(description = "Reset the cover art cache")]
+    Reset,
 }
 
-static DB: LazyLock<Mutex<Db>> = LazyLock::new(|| Mutex::new(Db::new()));
 static ME: OnceLock<Me> = OnceLock::new();
 static COMMAND_USAGE_MAP: LazyLock<HashMap<String, &str>> = LazyLock::new(|| {
     let mut h = HashMap::new();
@@ -240,6 +240,11 @@ async fn message_handler(bot: Bot, msg: Message) -> Result<(), Box<dyn Error + S
                     .reply_parameters(ReplyParameters::new(msg.id).allow_sending_without_reply())
                     .await?;
                 track("privacy", from).await;
+                return Ok(());
+            }
+            Ok(Command::Reset) => {
+                reset_command(&bot, &msg).await?;
+                track("reset", from).await;
                 return Ok(());
             }
             Ok(_) => {
@@ -404,12 +409,52 @@ async fn start_command(bot: &Bot, chat_id: ChatId) -> Result<(), Box<dyn Error +
     Ok(())
 }
 
+async fn reset_command(bot: &Bot, msg: &Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let is_owner = msg
+        .from
+        .as_ref()
+        .map(|u| u.id.0.to_string() == config::OWNER_ID)
+        .unwrap_or(false);
+
+    if !is_owner {
+        bot.send_message(msg.chat.id, "This command is admin only.")
+            .await?;
+        return Ok(());
+    }
+
+    let cleared = DB.lock().unwrap().clear_cover_art_cache().unwrap_or(0);
+    bot.send_message(
+        msg.chat.id,
+        format!("Cover art cache cleared ({cleared} entries)."),
+    )
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Display, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 enum StatusType {
     Compact,
     CompactWithCover,
     Expanded,
+}
+
+/// Turn a tag list into `#hashtag` text, keeping only tags that contain a word from the
+/// acceptable genres list and normalizing each tag into an underscore-separated word.
+fn format_tags(tags: Vec<String>, acceptable: &HashSet<String>) -> String {
+    tags.iter()
+        .map(|t| t.to_lowercase())
+        .filter(|t| t.split(' ').any(|x| acceptable.contains(x)))
+        .map(|t| {
+            t.replace(
+                &['(', ')', ',', '\"', '.', ';', ':', '\'', '-', ' ', '/'][..],
+                "_",
+            )
+        })
+        .filter(|x| !x.is_empty())
+        .map(|x| format!("#{x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -429,6 +474,8 @@ async fn status_command(
             .map(|x| x.unwrap())
             .collect()
     });
+
+    let started = std::time::Instant::now();
 
     let from = utils::choose_the_from(msg, inline_from);
 
@@ -457,6 +504,8 @@ async fn status_command(
     )
     .await;
 
+    log::info!("status: fetch_recent_tracks took {:?}", started.elapsed());
+
     match tracks {
         Ok(tracks) => {
             if tracks.is_empty() {
@@ -467,13 +516,107 @@ async fn status_command(
                 return Ok(());
             }
 
-            let mut album_art_url =
-                api_requester::resolve_cover_art_url(tracks[0].album_art_url.as_deref()).await;
-
+            // Resolving cover art means probing the network (up to ~2s cold). A plain
+            // Compact status doesn't render the art, so resolve it in the background to
+            // warm the cache and send the text right away; the cover is only awaited when
+            // it's actually going to be shown (cover/expanded/photo).
+            let needs_cover = status_type != StatusType::Compact || msg_is_photo;
+            let mut album_art_url: Option<String> = None;
             let mut user_playcount = 0;
+
+            // What actually fed this status — reported by the ℹ️ button.
+            let mut plays_src = match user.api_type() {
+                ApiType::Listenbrainz => 'b',
+                ApiType::Lastfm => 'l',
+                ApiType::Librefm => 'r',
+            };
+            let mut art_src = 'n';
+            let mut tags_src = 'n';
+
+            if needs_cover {
+                let cover_start = std::time::Instant::now();
+                if user.api_type() == ApiType::Listenbrainz {
+                    // Resolve the cover and fetch the play count concurrently — both are
+                    // network calls, no reason to wait for them one after the other.
+                    let resolve_fut = api_requester::resolve_cover_art_url(
+                        tracks[0].album_art_url.as_deref(),
+                    );
+                    let playcount_fut = api_requester::fetch_listenbrainz_track_playcount(
+                        user.account_username.as_str(),
+                        tracks[0].artist.as_str(),
+                        tracks[0].name.as_str(),
+                        tracks[0].recording_mbid.as_deref(),
+                    );
+                    let (resolved, playcount) = tokio::join!(resolve_fut, playcount_fut);
+                    album_art_url = resolved;
+                    user_playcount = playcount.unwrap_or_default();
+                } else {
+                    album_art_url = api_requester::resolve_cover_art_url(
+                        tracks[0].album_art_url.as_deref(),
+                    )
+                    .await;
+                }
+                log::info!(
+                    "status: cover resolve took {:?} (resolved={}, total {:?})",
+                    cover_start.elapsed(),
+                    album_art_url.is_some(),
+                    started.elapsed()
+                );
+            } else if let Some(url) = tracks[0].album_art_url.clone() {
+                // Warm the cache (resolved url + image bytes) off the critical path, so a
+                // later cover click can upload the bytes directly instead of waiting on
+                // Telegram to fetch the image from the CDN. When the primary url is a
+                // miss, also warm the Last.fm track/album fallback so the click finds art
+                // (and bytes) already cached.
+                let account_username = user.account_username.clone();
+                let api_type = user.api_type();
+                let artist = tracks[0].artist.clone();
+                let track_name = tracks[0].name.clone();
+                let album = tracks[0].album.clone();
+                tokio::spawn(async move {
+                    let start = std::time::Instant::now();
+                    let mut resolved = api_requester::resolve_cover_art_url(Some(&url)).await;
+
+                    if resolved.is_none() && api_type != ApiType::Librefm {
+                        if let Ok(track_info) = api_requester::fetch_lastfm_track(
+                            Some(account_username.clone()),
+                            artist.clone(),
+                            track_name,
+                        )
+                        .await
+                        {
+                            let mut candidate = track_info.album_art_url;
+                            if candidate.is_none()
+                                && let Some(album) = album.as_deref()
+                            {
+                                candidate = api_requester::fetch_lastfm_album(
+                                    &account_username,
+                                    &artist,
+                                    album,
+                                )
+                                .await
+                                .ok()
+                                .and_then(|album| album.album_art_url);
+                            }
+                            resolved =
+                                api_requester::resolve_cover_art_url(candidate.as_deref()).await;
+                        }
+                    }
+
+                    if let Some(resolved) = &resolved {
+                        let _ = api_requester::cover_art_bytes(Some(resolved)).await;
+                    }
+                    log::info!(
+                        "status: bg cover warm took {:?} (resolved={})",
+                        start.elapsed(),
+                        resolved.is_some()
+                    );
+                });
+            }
+
             let mut tags_text: String = "".to_string();
 
-            if user.api_type() == ApiType::Listenbrainz {
+            if user.api_type() == ApiType::Listenbrainz && !needs_cover {
                 user_playcount = api_requester::fetch_listenbrainz_track_playcount(
                     user.account_username.as_str(),
                     tracks[0].artist.as_str(),
@@ -484,11 +627,49 @@ async fn status_command(
                 .unwrap_or_default();
             }
 
-            // Last.fm is the source for tags, and the fallback for the play count when
-            // ListenBrainz is down or hasn't indexed the track yet (same username assumed),
-            // as well as for cover art: the Cover Art Archive holds nothing for plenty of
-            // releases ListenBrainz maps a listen to, and a playing-now listen often carries
-            // no release mbid at all, both of which leave the resolved url empty.
+            // Tags: prefer MusicBrainz genres via the recording mbid ListenBrainz carries;
+            // fall back to Last.fm album tags (track-level toptags no longer exist).
+            // The album.getInfo call below also doubles as the art fallback source.
+            let album_info = if user.api_type() != ApiType::Librefm {
+                match tracks[0].album.as_deref() {
+                    Some(album) => api_requester::fetch_lastfm_album(
+                        user.account_username.as_str(),
+                        tracks[0].artist.as_str(),
+                        album,
+                    )
+                    .await
+                    .ok(),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let mb_genres = api_requester::fetch_mb_genres(
+                tracks[0].recording_mbid.as_deref(),
+                tracks[0].release_group_mbid.as_deref(),
+                tracks[0].release_mbid.as_deref(),
+            )
+            .await;
+
+            if let Some(genres) = &mb_genres {
+                tags_text = format_tags(genres.clone(), &ACCEPTABLE_TAGS);
+                if !tags_text.is_empty() {
+                    tags_src = 'm';
+                }
+            }
+            if tags_text.is_empty() && let Some(album_info) = &album_info {
+                tags_text = format_tags(album_info.tags.clone().unwrap_or_default(), &ACCEPTABLE_TAGS);
+                if !tags_text.is_empty() {
+                    tags_src = 'l';
+                }
+            }
+
+            // Last.fm is the fallback for the play count when ListenBrainz is down or
+            // hasn't indexed the track yet (same username assumed), as well as for cover
+            // art: the Cover Art Archive holds nothing for plenty of releases ListenBrainz
+            // maps a listen to, and a playing-now listen often carries no release mbid at
+            // all, both of which leave the resolved url empty.
             if user.api_type() != ApiType::Librefm
                 && (user_playcount == 0 || album_art_url.is_none())
             {
@@ -502,48 +683,36 @@ async fn status_command(
                 if let Ok(track_info) = track_info {
                     if user_playcount == 0 {
                         user_playcount = track_info.user_playcount;
+                        if user_playcount > 0 {
+                            plays_src = 'f';
+                        }
                     }
 
-                    if album_art_url.is_none() {
-                        // track.getInfo only carries a cover when Last.fm knows which album
-                        // the track belongs to; when it doesn't, the album name that came
-                        // with the listen gets us to the same art through album.getInfo.
-                        let mut candidate = track_info.album_art_url;
-
-                        if candidate.is_none()
-                            && let Some(album) = tracks[0].album.as_deref()
-                        {
-                            candidate = api_requester::fetch_lastfm_album(
-                                user.account_username.as_str(),
-                                tracks[0].artist.as_str(),
-                                album,
-                            )
-                            .await
-                            .ok()
-                            .and_then(|album| album.album_art_url);
-                        }
+                    if needs_cover && album_art_url.is_none() {
+                        // CAA (or the primary Last.fm url) holds no art for this release,
+                        // so fall back to Last.fm's own track/album art. The secondary
+                        // source is reached even when the primary is a cached miss; that
+                        // miss only says the primary url is dead, not that Last.fm has
+                        // nothing. Repeats stay cheap: the API calls are cached and the
+                        // secondary candidate url is negative-cached once probed.
+                        let candidate = track_info
+                            .album_art_url
+                            .or_else(|| album_info.as_ref().and_then(|a| a.album_art_url.clone()));
 
                         album_art_url =
                             api_requester::resolve_cover_art_url(candidate.as_deref()).await;
                     }
-
-                    tags_text = track_info
-                        .tags
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|t| t.to_lowercase())
-                        .filter(|t| t.split(' ').any(|x| ACCEPTABLE_TAGS.contains(x)))
-                        .map(|t| {
-                            t.replace(
-                                &['(', ')', ',', '\"', '.', ';', ':', '\'', '-', ' ', '/'][..],
-                                "_",
-                            )
-                        })
-                        .filter(|x| !x.is_empty())
-                        .map(|x| format!("#{x}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
                 }
+            }
+
+            if let Some(url) = &album_art_url {
+                art_src = if url.contains("coverartarchive.org") {
+                    'c'
+                } else if url.contains("lastfm") {
+                    'l'
+                } else {
+                    'u'
+                };
             }
 
             let mut first_track_info = if user_playcount > 0 {
@@ -616,8 +785,10 @@ async fn status_command(
                     ));
                 }
                 StatusType::Compact => {
-                    // Offer the cover button only for art we've confirmed is sendable.
-                    if album_art_url.is_some() {
+                    // Offer the cover button whenever the track has an art url to try; the
+                    // confirmation runs in the background and the cache is usually warm by
+                    // the time the button is pressed.
+                    if tracks[0].album_art_url.is_some() {
                         keyboard[0].push(InlineKeyboardButton::callback(
                             "🖼️",
                             format!("{} status {}", from.id.0, StatusType::CompactWithCover),
@@ -641,7 +812,11 @@ async fn status_command(
             }
 
             if inline_message_id.is_none() {
-                keyboard[0].push(InlineKeyboardButton::callback("ℹ️", "0 info"));
+                let code = format!("{plays_src}{art_src}{tags_src}");
+                keyboard[0].push(InlineKeyboardButton::callback(
+                    "ℹ️",
+                    format!("{} info {}", from.id.0, code),
+                ));
             }
 
             keyboard[0].push(InlineKeyboardButton::callback(
@@ -654,13 +829,23 @@ async fn status_command(
                 && album_art_url.is_some())
                 || msg_is_photo
             {
-                utils::send_or_edit_photo(
-                    bot,
+                let send_start = std::time::Instant::now();
+                let media = if let Some(bytes) =
+                    api_requester::cover_art_bytes(album_art_url.as_deref()).await
+                {
+                    // Bytes already cached (warmed in the background): upload directly, no
+                    // Telegram-side CDN fetch.
+                    InputMediaPhoto::new(InputFile::memory(bytes))
+                } else {
                     InputMediaPhoto::new(InputFile::url(Url::parse(
                         album_art_url.as_deref().unwrap_or(consts::LASTFM_STAR_URL),
                     )?))
-                    .caption(text)
-                    .show_caption_above_media(true),
+                };
+                utils::send_or_edit_photo(
+                    bot,
+                    media
+                        .caption(text)
+                        .show_caption_above_media(true),
                     msg,
                     inline_message_id.as_ref(),
                     edit,
@@ -668,6 +853,11 @@ async fn status_command(
                     false,
                 )
                 .await?;
+                log::info!(
+                    "status: photo send took {:?} (total {:?})",
+                    send_start.elapsed(),
+                    started.elapsed()
+                );
             } else {
                 utils::send_or_edit_message(
                     bot,
@@ -1795,56 +1985,6 @@ async fn inline_result_handler(
     Ok(())
 }
 
-async fn fetch_lastfm_infos(
-    username: String,
-    artist_p: String,
-    title_p: String,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let artist_req = task::spawn(api_requester::fetch_lastfm_artist(
-        username.clone().into(),
-        artist_p.clone(),
-    ));
-    let track_req = task::spawn(api_requester::fetch_lastfm_track(
-        username.into(),
-        artist_p,
-        title_p,
-    ));
-
-    let artist = artist_req
-        .await?
-        .map(|e| {
-            format!(
-                "🎙️ {}:\n{} plays\n{} 🌎 listeners\n{} 🌎 scrobbles",
-                e.name,
-                e.user_playcount.to_formatted_string(&Locale::en),
-                e.listeners.to_formatted_string(&Locale::en),
-                e.playcount.to_formatted_string(&Locale::en)
-            )
-        })
-        .unwrap_or_default();
-    let track = track_req
-        .await?
-        .map(|e| {
-            format!(
-                "🎵 {} ({}):\n{} plays\n{} 🌎 listeners\n{} 🌎 scrobbles",
-                e.name,
-                if e.duration > 0 {
-                    utils::human_readable_duration(e.duration)
-                } else {
-                    "??:??".to_string()
-                },
-                e.user_playcount.to_formatted_string(&Locale::en),
-                e.listeners.to_formatted_string(&Locale::en),
-                e.playcount.to_formatted_string(&Locale::en)
-            )
-        })
-        .unwrap_or_else(|_| "Failed to fetch track info".to_string());
-
-    let text = format!("{track}\n\n{artist}");
-
-    Ok(text)
-}
-
 async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Error + Send + Sync>> {
     let callback_data = q.data.as_ref().unwrap();
     log::debug!("callback from {}: {callback_data}", q.from.id.0);
@@ -1925,65 +2065,37 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
             }
         }
         "info" => {
-            // regular_message must not be None here
+            let mut code = arg.chars();
+            let plays = code.next().unwrap_or('?');
+            let art = code.next().unwrap_or('?');
+            let tags = code.next().unwrap_or('?');
 
-            match regular_message {
-                None => {
-                    bot.answer_callback_query(q.id)
-                        .text(consts::NO)
-                        .show_alert(true)
-                        .await?;
-                    return Ok(());
-                }
+            let plays_txt = match plays {
+                'b' => "ListenBrainz",
+                'f' => "Last.fm (fallback)",
+                'l' => "Last.fm",
+                'r' => "Libre.fm",
+                _ => "unknown",
+            };
+            let art_txt = match art {
+                'c' => "Cover Art Archive (MusicBrainz)",
+                'l' => "Last.fm",
+                'n' => "none",
+                _ => "unknown",
+            };
+            let tags_txt = match tags {
+                'm' => "MusicBrainz",
+                'l' => "Last.fm (album)",
+                'n' => "none",
+                _ => "unknown",
+            };
 
-                Some(regular_message) => {
-                    if user.api_type() == ApiType::Lastfm {
-                        let msg_text = regular_message.text().unwrap_or_default().to_string();
-                        let itatic_entity =
-                            utils::find_first_entity(regular_message, MessageEntityKind::Italic);
-                        let bold_entity =
-                            utils::find_first_entity(regular_message, MessageEntityKind::Bold);
-
-                        if itatic_entity.is_none() || bold_entity.is_none() {
-                            bot.answer_callback_query(q.id)
-                                .text(consts::NOT_FOUND)
-                                .await?;
-                            return Ok(());
-                        }
-
-                        let ita = itatic_entity.unwrap();
-                        let bol = bold_entity.unwrap();
-
-                        let artist = utils::slice_tg_string(
-                            msg_text.clone(),
-                            ita.offset,
-                            ita.length + ita.offset,
-                        );
-                        let title =
-                            utils::slice_tg_string(msg_text, bol.offset, bol.length + bol.offset);
-
-                        if artist.is_none() || title.is_none() {
-                            bot.answer_callback_query(q.id)
-                                .text(consts::NOT_FOUND)
-                                .await?;
-                            return Ok(());
-                        }
-
-                        let lastfm_username = user.account_username;
-
-                        let infos =
-                            fetch_lastfm_infos(lastfm_username, artist.unwrap(), title.unwrap())
-                                .await
-                                .unwrap_or(consts::NOT_FOUND.to_owned());
-                        bot.answer_callback_query(q.id)
-                            .text(infos)
-                            .show_alert(true)
-                            .await?;
-                    } else {
-                        bot.answer_callback_query(q.id).text(consts::NO).await?;
-                    }
-                }
-            }
+            bot.answer_callback_query(q.id)
+                .text(format!(
+                    "ℹ️ This status used:\n• Scrobbles/plays: {plays_txt}\n• Album art: {art_txt}\n• Tags: {tags_txt}"
+                ))
+                .show_alert(true)
+                .await?;
         }
 
         "collage" => {

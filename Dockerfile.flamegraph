@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# Flamegraph profiling variant of lastfmrobot.
+#
+# Builds the binary WITH debug symbols (overrides the release `strip = true` in
+# Cargo.toml) and ships `perf` plus the FlameGraph tools, so you can record CPU
+# samples against a live container while a /status runs.
+#
+# Build & run (needs a privileged container so perf_event_open isn't blocked):
+#   docker build -f Dockerfile.flamegraph -t lastfmrobot-flame .
+#   docker run -d --name lastfmrobot-flame \
+#     --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+#     --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+#     -v ./NotoSerifCJK.ttc:/app/NotoSerifCJK.ttc:ro \
+#     -v ./users.sqlite:/app/users.sqlite \
+#     lastfmrobot-flame
+#
+# Fire a /status at the bot, then while a second /status is in flight:
+#   docker exec lastfmrobot-flame sh -c 'perf record -a -g -o /tmp/perf.data -- sleep 20'
+#   docker exec lastfmrobot-flame sh -c \
+#     'perf script -i /tmp/perf.data | stackcollapse-perf.pl | flamegraph.pl > /tmp/flame.svg'
+#   docker cp lastfmrobot-flame:/tmp/flame.svg .
+#
+# The bot also logs stage timings at info level (status: fetch_recent_tracks took ...,
+# status: cover resolve took ...) with RUST_LOG=info.
+
+FROM rust:alpine AS builder
+
+RUN apk add --no-cache musl-dev gcc pkgconf sqlite-dev openssl-dev
+
+# musl targets default to fully static linking (crt-static), but Alpine's
+# sqlite-dev/openssl-dev only ship .so files, not .a static archives. Link
+# dynamically instead - the runtime stage already installs sqlite-libs/libssl3.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+# Keep symbols for flamegraphs (Cargo.toml sets strip=true by default).
+ENV CARGO_PROFILE_RELEASE_STRIP=false
+
+WORKDIR /app
+
+# Cache dependency compilation in its own layer, separate from source changes.
+COPY Cargo.toml ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src
+
+COPY src ./src
+RUN apk add --no-cache ca-certificates libgcc sqlite-libs libssl3
+RUN touch src/main.rs && cargo build --release --locked
+
+FROM alpine:latest
+
+RUN apk add --no-cache ca-certificates libgcc sqlite-libs libssl3 perf curl
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/lastfmrobot ./lastfmrobot
+COPY everynoise_genres.txt ./everynoise_genres.txt
+
+# FlameGraph tooling: perf script | stackcollapse-perf.pl | flamegraph.pl
+RUN curl -fsSL https://raw.githubusercontent.com/brendangregg/FlameGraph/master/stackcollapse-perf.pl -o /usr/local/bin/stackcollapse-perf.pl && \
+    curl -fsSL https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl -o /usr/local/bin/flamegraph.pl && \
+    chmod +x /usr/local/bin/stackcollapse-perf.pl /usr/local/bin/flamegraph.pl
+
+ENTRYPOINT ["./lastfmrobot"]

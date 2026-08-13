@@ -15,7 +15,7 @@ use teloxide::{
     requests::Requester,
     types::{
         InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto, LinkPreviewOptions, Message,
-        MessageEntity, MessageEntityKind, ParseMode, ReplyParameters,
+        ParseMode, ReplyParameters,
     },
 };
 
@@ -30,16 +30,6 @@ pub fn replace_html_symbols(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-pub fn find_first_entity(msg: &Message, entity_kind: MessageEntityKind) -> Option<MessageEntity> {
-    let entity = msg
-        .entities()
-        .unwrap_or_default()
-        .iter()
-        .find(|&e| e.kind == entity_kind);
-
-    entity.cloned()
-}
-
 pub fn choose_the_from(
     msg: Option<&Message>,
     inline_from: Option<&teloxide::types::User>,
@@ -47,13 +37,6 @@ pub fn choose_the_from(
     inline_from
         .unwrap_or_else(|| msg.as_ref().unwrap().from.as_ref().unwrap())
         .clone()
-}
-
-pub fn human_readable_duration(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let minutes = seconds / 60;
-    let seconds_remaining = seconds % 60;
-    format!("{minutes}:{seconds_remaining:02}")
 }
 
 pub fn name_with_link(tg_user: &teloxide::types::User, db_user: &db::User) -> String {
@@ -76,29 +59,6 @@ pub fn name_with_link(tg_user: &teloxide::types::User, db_user: &db::User) -> St
     } else {
         name
     }
-}
-
-pub fn slice_tg_string(s: String, start: usize, end: usize) -> Option<String> {
-    let mut utf16_len = 0;
-    let mut start_byte = None;
-    let mut end_byte = None;
-
-    for (i, ch) in s.char_indices() {
-        if utf16_len == start {
-            start_byte = Some(i);
-        }
-        if utf16_len == end {
-            end_byte = Some(i);
-            break;
-        }
-        utf16_len += ch.len_utf16();
-    }
-
-    if start_byte.is_none() || end_byte.is_none() {
-        return None;
-    }
-
-    Some(s[start_byte.unwrap()..end_byte.unwrap()].to_string())
 }
 
 pub async fn send_or_edit_message(
