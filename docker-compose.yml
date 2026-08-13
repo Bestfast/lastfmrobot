@@ -3,6 +3,8 @@ services:
     build: .
     image: lastfmrobot
     restart: unless-stopped
+    environment:
+      - RUST_LOG=debug
     volumes:
       - ./NotoSerifCJK.ttc:/app/NotoSerifCJK.ttc:ro
       - ./users.sqlite:/app/users.sqlite

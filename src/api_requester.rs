@@ -453,17 +453,16 @@ pub async fn resolve_cover_art_fallback(
         return None;
     }
 
-    let Ok(track_info) = fetch_lastfm_track(
+    // track.getInfo often fails (or comes back art-less) for multi-artist credits, so it
+    // must not gate the album lookup — the album path below is what usually finds art.
+    let track_info = fetch_lastfm_track(
         Some(username.to_string()),
         artist.to_string(),
         track.to_string(),
     )
     .await
-    else {
-        return None;
-    };
-
-    let mut candidate = track_info.album_art_url;
+    .ok();
+    let mut candidate = track_info.as_ref().and_then(|t| t.album_art_url.clone());
 
     if candidate.is_none() && let Some(album) = album {
         if let Ok(album_info) = fetch_lastfm_album(username, artist, album).await {

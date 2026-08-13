@@ -651,10 +651,7 @@ async fn status_command(
             }
 
             // Last.fm is the fallback for the play count when ListenBrainz is down or
-            // hasn't indexed the track yet (same username assumed), as well as for cover
-            // art: the Cover Art Archive holds nothing for plenty of releases ListenBrainz
-            // maps a listen to, and a playing-now listen often carries no release mbid at
-            // all, both of which leave the resolved url empty.
+            // hasn't indexed the track yet (same username assumed).
             if user.api_type() != ApiType::Librefm
                 && (user_playcount == 0 || album_art_url.is_none())
             {
@@ -672,26 +669,27 @@ async fn status_command(
                             plays_src = 'f';
                         }
                     }
-
-                    if needs_cover && album_art_url.is_none() {
-                        // CAA (or the primary Last.fm url) holds no art for this release,
-                        // so fall back to Last.fm's own track/album art — retrying with the
-                        // leading artist of a multi-artist credit, since Last.fm often
-                        // only serves the album image under that. The secondary source is
-                        // reached even when the primary is a cached miss; that miss only
-                        // says the primary url is dead, not that Last.fm has nothing.
-                        // Repeats stay cheap: the API calls are cached and the resolved
-                        // url is cached too.
-                        album_art_url = api_requester::resolve_cover_art_fallback(
-                            &user.account_username,
-                            &user.api_type(),
-                            tracks[0].name.as_str(),
-                            tracks[0].artist.as_str(),
-                            tracks[0].album.as_deref(),
-                        )
-                        .await;
-                    }
                 }
+            }
+
+            // Cover art fallback runs even when track.getInfo failed above - that failure
+            // is common for multi-artist credits, while the album lookup still finds art.
+            if needs_cover && album_art_url.is_none() {
+                // CAA (or the primary Last.fm url) holds no art for this release, so fall
+                // back to Last.fm's own track/album art - retrying with the leading artist
+                // of a multi-artist credit, since Last.fm often only serves the album image
+                // under that. The secondary source is reached even when the primary is a
+                // cached miss; that miss only says the primary url is dead, not that
+                // Last.fm has nothing. Repeats stay cheap: the API calls are cached and
+                // the resolved url is cached too.
+                album_art_url = api_requester::resolve_cover_art_fallback(
+                    &user.account_username,
+                    &user.api_type(),
+                    tracks[0].name.as_str(),
+                    tracks[0].artist.as_str(),
+                    tracks[0].album.as_deref(),
+                )
+                .await;
             }
 
             if let Some(url) = &album_art_url {
