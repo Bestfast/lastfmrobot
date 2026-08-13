@@ -779,50 +779,36 @@ pub async fn fetch_lastfm_track(
 
 pub async fn fetch_listenbrainz_track_playcount(
     username: &str,
-    _artist: &str,
-    _track: &str,
+    artist: &str,
+    track: &str,
     recording_mbid: Option<&str>,
 ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-    // The stats endpoint only covers the user's top-1000 recordings, so any track outside
-    // that window reports 0. Count the real listens instead: page through /listens filtered
-    // by recording mbid. Tracks under 100 plays cost a single request.
-    let Some(recording_mbid) = recording_mbid else {
-        return Ok(0);
-    };
-
+    let base_url = get_base_url(&ApiType::Listenbrainz);
+    let url = format!("{base_url}stats/user/{username}/recordings?range=all_time&count=1000");
     let t0 = std::time::Instant::now();
-    let mut total: u64 = 0;
-    let mut max_ts: Option<i64> = None;
+    let response = CLIENT.get(&url).send().await?;
+    let json = response.json::<serde_json::Value>().await?;
+    log::debug!("api: LB playcount took {:?}", t0.elapsed());
 
-    loop {
-        let base = format!(
-            "https://api.listenbrainz.org/1/user/{username}/listens?count=100&recording_mbid={recording_mbid}"
-        );
-        let url = match max_ts {
-            Some(ts) => format!("{base}&max_ts={ts}"),
-            None => base,
-        };
-        let response = CLIENT.get(&url).send().await?;
-        let json = response.json::<serde_json::Value>().await?;
-        let listens = json["payload"]["listens"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let n = listens.len();
-        total += n as u64;
+    let user_playcount = json["payload"]["recordings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|recording| {
+            // ListenBrainz formats the artist credit differently between the live listen and
+            // the stats endpoint (e.g. "Gmtn., kozato, Luze" vs "gmtn. vs. kozato (fw. LUZE)"),
+            // so match on recording_mbid when we have it and only fall back to name matching.
+            if let Some(recording_mbid) = recording_mbid {
+                recording["recording_mbid"].as_str() == Some(recording_mbid)
+            } else {
+                recording["artist_name"].as_str().unwrap_or_default().eq_ignore_ascii_case(artist)
+                    && recording["track_name"].as_str().unwrap_or_default().eq_ignore_ascii_case(track)
+            }
+        })
+        .and_then(|recording| recording["listen_count"].as_u64())
+        .unwrap_or_default();
 
-        if n < 100 {
-            break;
-        }
-        // Page backwards past the oldest listen in this page.
-        max_ts = listens
-            .last()
-            .and_then(|l| l["listened_at"].as_i64())
-            .map(|t| t - 1);
-    }
-
-    log::debug!("api: LB playcount took {:?} (count={total})", t0.elapsed());
-    Ok(total)
+    Ok(user_playcount)
 }
 
 pub async fn fetch_lastfm_album(
