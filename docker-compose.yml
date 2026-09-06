@@ -8,3 +8,12 @@ services:
     volumes:
       - ./NotoSerifCJK.ttc:/app/NotoSerifCJK.ttc:ro
       - ./users.sqlite:/app/users.sqlite
+    networks:
+      - default
+      # happyloltroll's Koito lives in another compose project on the same
+      # host; join its network so the bot reaches it at http://koito:4110.
+      - koito_default
+
+networks:
+  koito_default:
+    external: true
