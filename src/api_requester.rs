@@ -246,42 +246,20 @@ static CLIENT_PROBE: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 // MusicBrainz requires a descriptive User-Agent (with contact info) or it answers 403.
-// Responses are cached like the other clients; genres are effectively immutable.
+// Plain client on purpose: the reqwest-middleware + http-cache stack stalled every
+// MusicBrainz lookup to the full timeout in production while plain requests answer
+// in ~200ms, and the persistent sqlite genre cache in front makes a shared-memory
+// HTTP cache redundant anyway.
 // HTTP/1.1 only: multiplexing concurrent lookups over one HTTP/2 connection to
-// musicbrainz.org proved flaky (all lookups stalling to the full timeout), while
-// plain HTTP/1.1 answers in ~200ms.
-static CLIENT_MB: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
-    ClientBuilder::new(
-        reqwest::ClientBuilder::new()
-            .timeout(Duration::from_secs(15))
-            .https_only(true)
-            .http1_only()
-            .user_agent("lastfmrobot/0.2 (+https://github.com/Bestfast/lastfmrobot)")
-            .build()
-            .unwrap(),
-    )
-    .with(Response200Middleware {})
-    .with(ForceCacheMiddleware {})
-    .with(Cache(HttpCache {
-        mode: CacheMode::Default,
-        manager: MokaManager::new(
-            moka::future::Cache::builder()
-                .max_capacity(500)
-                .time_to_live(Duration::from_secs(6 * 60 * 60))
-                .build(),
-        ),
-        options: http_cache_reqwest::HttpCacheOptions {
-            cache_options: CacheOptions {
-                shared: false,
-                immutable_min_time_to_live: Duration::from_secs(6 * 60 * 60),
-                ignore_cargo_cult: true,
-                ..Default::default()
-            }
-            .into(),
-            ..Default::default()
-        },
-    }))
-    .build()
+// musicbrainz.org also proved flaky, while plain HTTP/1.1 is instant.
+static CLIENT_MB: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .https_only(true)
+        .http1_only()
+        .user_agent("lastfmrobot/0.2 (+https://github.com/Bestfast/lastfmrobot)")
+        .build()
+        .unwrap()
 });
 
 fn mb_names(json: &serde_json::Value, key: &str) -> Vec<String> {
@@ -302,14 +280,11 @@ async fn mb_genres_for(path: String) -> Option<Vec<String>> {
         return Some(cached);
     }
     let url = format!("https://musicbrainz.org/ws/2/{path}?inc=genres+tags&fmt=json");
-    let json = CLIENT_MB
-        .get(&url)
-        .send()
-        .await
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
+    let response = CLIENT_MB.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json = response.json::<serde_json::Value>().await.ok()?;
 
     let genres = mb_names(&json, "genres");
     let list = if genres.is_empty() {
