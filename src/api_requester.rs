@@ -280,16 +280,61 @@ static CLIENT_MB: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
     .build()
 });
 
+fn mb_names(json: &serde_json::Value, key: &str) -> Vec<String> {
+    json[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Genres (falling back to tags) for one MusicBrainz entity, served from the
+/// persistent cache when known. A successful lookup is cached even when the
+/// entity carries nothing, so genre-less mbids don't cost a request per
+/// status; transient failures stay uncached and retry next time.
+async fn mb_genres_for(path: String) -> Option<Vec<String>> {
+    if let Some(cached) = crate::db::DB.lock().unwrap().get_mb_genres(&path) {
+        return Some(cached);
+    }
+    let url = format!("https://musicbrainz.org/ws/2/{path}?inc=genres+tags&fmt=json");
+    let json = CLIENT_MB
+        .get(&url)
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+
+    let genres = mb_names(&json, "genres");
+    let list = if genres.is_empty() {
+        mb_names(&json, "tags")
+    } else {
+        genres
+    };
+    crate::db::DB
+        .lock()
+        .unwrap()
+        .store_mb_genres(&path, &list)
+        .ok();
+    Some(list)
+}
+
 /// MusicBrainz genres for a track, tried release-group → recording → release (release
 /// groups carry genres most often). ListenBrainz tracks carry these mbids, which makes
-/// this the natural tag source; Last.fm's track-level toptags no longer exist. MB is
-/// rate-limited, so failures (429/503) fall through to None and the caller falls back.
+/// this the natural tag source; Last.fm's track-level toptags no longer exist. The
+/// lookups run concurrently and the first hit in priority order wins, so slow
+/// entities cost one round trip instead of three; MB failures (429/503) fall through
+/// to None and the caller falls back.
 pub async fn fetch_mb_genres(
     recording_mbid: Option<&str>,
     release_group_mbid: Option<&str>,
     release_mbid: Option<&str>,
 ) -> Option<Vec<String>> {
-    for mbid in [
+    let t0 = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(3);
+    for path in [
         release_group_mbid.map(|m| format!("release-group/{m}")),
         recording_mbid.map(|m| format!("recording/{m}")),
         release_mbid.map(|m| format!("release/{m}")),
@@ -297,36 +342,24 @@ pub async fn fetch_mb_genres(
     .into_iter()
     .flatten()
     {
-        let url = format!("https://musicbrainz.org/ws/2/{mbid}?inc=genres+tags&fmt=json");
-        let Ok(response) = CLIENT_MB.get(&url).send().await else {
-            continue;
-        };
-        let Ok(json) = response.json::<serde_json::Value>().await else {
-            continue;
-        };
-
-        let genres: Vec<String> = json["genres"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|g| g["name"].as_str().map(str::to_string))
-            .collect();
-        if !genres.is_empty() {
-            return Some(genres);
-        }
-
-        let tags: Vec<String> = json["tags"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| t["name"].as_str().map(str::to_string))
-            .collect();
-        if !tags.is_empty() {
-            return Some(tags);
-        }
+        handles.push(tokio::spawn(mb_genres_for(path)));
     }
 
-    None
+    let mut found = None;
+    for handle in handles {
+        if let Ok(Some(list)) = handle.await
+            && !list.is_empty()
+            && found.is_none()
+        {
+            found = Some(list);
+        }
+    }
+    log::debug!(
+        "api: mb genres took {:?} (hit={})",
+        t0.elapsed(),
+        found.is_some()
+    );
+    found
 }
 
 type BoxError = Box<dyn Error + Send + Sync>;

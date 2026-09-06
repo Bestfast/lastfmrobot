@@ -676,30 +676,33 @@ async fn status_command(
                 .unwrap_or_default();
             }
 
-            // Tags: prefer MusicBrainz genres via the recording mbid ListenBrainz carries;
+            // Tags: prefer MusicBrainz genres via the recording mbid the track carries;
             // fall back to Last.fm album tags (track-level toptags no longer exist).
             // The album.getInfo call below also doubles as the art fallback source.
-            let album_info = if user.api_type() != ApiType::Librefm {
-                match tracks[0].album.as_deref() {
-                    Some(album) => api_requester::fetch_lastfm_album(
-                        user.account_username.as_str(),
-                        tracks[0].artist.as_str(),
-                        album,
-                    )
-                    .await
-                    .ok(),
-                    None => None,
-                }
-            } else {
-                None
-            };
-
-            let mb_genres = api_requester::fetch_mb_genres(
-                tracks[0].recording_mbid.as_deref(),
-                tracks[0].release_group_mbid.as_deref(),
-                tracks[0].release_mbid.as_deref(),
-            )
-            .await;
+            // Both are independent network calls, so they run concurrently.
+            let (album_info, mb_genres) = tokio::join!(
+                async {
+                    if user.api_type() != ApiType::Librefm {
+                        match tracks[0].album.as_deref() {
+                            Some(album) => api_requester::fetch_lastfm_album(
+                                user.account_username.as_str(),
+                                tracks[0].artist.as_str(),
+                                album,
+                            )
+                            .await
+                            .ok(),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    }
+                },
+                api_requester::fetch_mb_genres(
+                    tracks[0].recording_mbid.as_deref(),
+                    tracks[0].release_group_mbid.as_deref(),
+                    tracks[0].release_mbid.as_deref(),
+                )
+            );
 
             if let Some(genres) = &mb_genres {
                 tags_text = format_tags(genres.clone(), &ACCEPTABLE_TAGS);

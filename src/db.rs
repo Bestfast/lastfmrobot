@@ -9,6 +9,10 @@ use crate::api_requester::ApiType;
 /// covers added to CAA later still get picked up.
 pub const COVER_ART_CACHE_TTL_SECS: i64 = 6 * 60 * 60;
 
+/// MusicBrainz genre entries expire after this long. Genres are effectively immutable;
+/// the long TTL just bounds the table while still re-validating monthly.
+pub const MB_GENRE_CACHE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
 #[derive(Clone, Debug)]
 pub struct User {
     pub tg_user_id: u64,
@@ -61,6 +65,14 @@ impl Db {
             "CREATE TABLE IF NOT EXISTS cover_art_cache (
             url             TEXT PRIMARY KEY,
             resolved        TEXT,
+            fetched_at      INTEGER NOT NULL
+            )",
+            (),
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS mb_genre_cache (
+            path            TEXT PRIMARY KEY,
+            genres          TEXT NOT NULL,
             fetched_at      INTEGER NOT NULL
             )",
             (),
@@ -128,6 +140,34 @@ impl Db {
 
     pub fn clear_cover_art_cache(&self) -> Result<usize> {
         self.conn.execute("DELETE FROM cover_art_cache", ())
+    }
+
+    /// Look up cached MusicBrainz genres/tags for an entity path
+    /// (`release-group/<mbid>` etc.). `Some(vec)` (possibly empty = known to
+    /// carry nothing) is a fresh hit; `None` means fetch from MB.
+    pub fn get_mb_genres(&self, path: &str) -> Option<Vec<String>> {
+        let cutoff = now_secs() - MB_GENRE_CACHE_TTL_SECS;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT genres FROM mb_genre_cache WHERE path = ?1 AND fetched_at >= ?2 LIMIT 1")
+            .unwrap();
+
+        stmt.query(params![path, cutoff])
+            .unwrap()
+            .next()
+            .ok()
+            .flatten()
+            .and_then(|row| row.get::<_, String>(0).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    pub fn store_mb_genres(&self, path: &str, genres: &[String]) -> Result<usize> {
+        let json = serde_json::to_string(genres).unwrap_or_else(|_| "[]".to_string());
+        self.conn.execute(
+            "INSERT INTO mb_genre_cache (path, genres, fetched_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (path) DO UPDATE SET genres = ?2, fetched_at = ?3",
+            params![path, json, now_secs()],
+        )
     }
 }
 

@@ -74,21 +74,33 @@ pub fn has_instance(uid: u64) -> bool {
 }
 
 async fn get_json(url: &str, inst: &KoitoInstance) -> Result<serde_json::Value, BoxError> {
-    let json = client_for(inst.url)
+    let response = client_for(inst.url)
         .get(url)
         .header("Authorization", format!("Token {}", inst.api_key))
         .send()
-        .await?
-        .json::<serde_json::Value>()
         .await?;
-    if json
-        .get("error")
-        .and_then(|e| e.as_str())
-        .is_some_and(|e| !e.is_empty())
-    {
-        return Err(Box::from(json["error"].as_str().unwrap_or("Koito error")));
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    // A non-JSON answer (e.g. a bare `401 Unauthorized` from a login gate
+    // with a missing/invalid API key) must read as what it is, not as a
+    // confusing "error decoding response body".
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(json) => {
+            if json
+                .get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|e| !e.is_empty())
+            {
+                return Err(Box::from(json["error"].as_str().unwrap_or("Koito error")));
+            }
+            Ok(json)
+        }
+        Err(_) => {
+            let snippet =
+                String::from_utf8_lossy(&bytes[..bytes.len().min(120)]).into_owned();
+            Err(format!("Koito {url} answered HTTP {status}: {snippet}").into())
+        }
     }
-    Ok(json)
 }
 
 fn artist_names(track: &serde_json::Value) -> String {
