@@ -247,11 +247,15 @@ static CLIENT_PROBE: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 // MusicBrainz requires a descriptive User-Agent (with contact info) or it answers 403.
 // Responses are cached like the other clients; genres are effectively immutable.
+// HTTP/1.1 only: multiplexing concurrent lookups over one HTTP/2 connection to
+// musicbrainz.org proved flaky (all lookups stalling to the full timeout), while
+// plain HTTP/1.1 answers in ~200ms.
 static CLIENT_MB: LazyLock<ClientWithMiddleware> = LazyLock::new(|| {
     ClientBuilder::new(
         reqwest::ClientBuilder::new()
             .timeout(Duration::from_secs(15))
             .https_only(true)
+            .http1_only()
             .user_agent("lastfmrobot/0.2 (+https://github.com/Bestfast/lastfmrobot)")
             .build()
             .unwrap(),
