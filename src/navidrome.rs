@@ -100,6 +100,89 @@ enum Lookup {
     Unreachable,
 }
 
+/// Genres for a recording mbid from Navidrome's file tags (`/api/song` filtered
+/// on `mbz_track_id` → `genres[].name`, falling back to the single `genre`
+/// string). Keyed by recording mbid, so it serves any user, not just gated
+/// ones. Hits (even genre-less songs) are cached in users.sqlite; a missing
+/// song or unreachable server stays uncached and retries next status.
+pub async fn fetch_track_genres(recording_mbid: &str) -> Option<Vec<String>> {
+    let key = format!("nd:track:{recording_mbid}");
+    if let Some(cached) = db::DB.lock().unwrap().get_mb_genres(&key) {
+        return Some(cached);
+    }
+    let Some(token) = login().await else {
+        return None;
+    };
+
+    let filters = format!("{{\"mbz_track_id\":\"{recording_mbid}\"}}");
+    let mut url = match Url::parse(&format!("{}/api/song", config::NAVIDROME_URL)) {
+        Ok(url) => url,
+        Err(_) => return None,
+    };
+    url.query_pairs_mut()
+        .append_pair("_filters", &filters)
+        .append_pair("_end", "1");
+
+    let resp = match CLIENT_ND
+        .get(url)
+        .header(X_ND_AUTHORIZATION.clone(), format!("Bearer {token}"))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!("navidrome: song lookup ({recording_mbid}) failed: {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        log::warn!(
+            "navidrome: song lookup ({recording_mbid}) returned {}",
+            resp.status()
+        );
+        return None;
+    }
+    let json: serde_json::Value = match resp.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("navidrome: song lookup ({recording_mbid}) json parse failed: {e}");
+            return None;
+        }
+    };
+
+    let song = json.as_array().and_then(|a| a.first());
+    let mut genres: Vec<String> = song
+        .and_then(|s| s.get("genres"))
+        .and_then(|g| g.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g["name"].as_str().map(str::to_string))
+        .filter(|g| !g.is_empty())
+        .collect();
+    if genres.is_empty()
+        && let Some(genre) = song
+            .and_then(|s| s.get("genre"))
+            .and_then(|g| g.as_str())
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+    {
+        genres.push(genre.to_string());
+    }
+    // Song found (even genre-less) → cache; no song → leave uncached so a
+    // later library rescan gets picked up.
+    if song.is_some() {
+        db::DB
+            .lock()
+            .unwrap()
+            .store_mb_genres(&key, &genres)
+            .ok();
+        Some(genres)
+    } else {
+        log::debug!("navidrome: no song for mbz_track_id={recording_mbid}");
+        None
+    }
+}
+
 // Native API `GET /api/album` with a field filter returns the album(s) whose
 // MusicBrainz id matches. Navidrome maps:
 //   `mbz_album_id`            <- MusicBrainz Album Id tag  (a *release* mbid)

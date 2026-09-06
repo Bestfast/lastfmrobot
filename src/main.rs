@@ -676,13 +676,14 @@ async fn status_command(
                 .unwrap_or_default();
             }
 
-            // Tags: prefer MusicBrainz genres via the recording mbid the track carries;
-            // fall back to Last.fm album tags (track-level toptags no longer exist).
-            // The album.getInfo call below also doubles as the art fallback source.
-            // Both are independent network calls, so they run concurrently.
+            // Tags, fastest source first: Navidrome file tags by recording mbid
+            // (local server, ms), then MusicBrainz genres, then Last.fm album
+            // tags (track-level toptags no longer exist).
+            // The album.getInfo call also doubles as the art fallback source.
+            // All three are independent network calls, so they run concurrently.
             // MB genres only resolve on expanded status — they are the slowest
             // lookup and compact doesn't need them.
-            let (album_info, mb_genres) = tokio::join!(
+            let (album_info, mb_genres, nd_genres) = tokio::join!(
                 async {
                     if user.api_type() != ApiType::Librefm {
                         match tracks[0].album.as_deref() {
@@ -710,10 +711,24 @@ async fn status_command(
                     } else {
                         None
                     }
+                },
+                async {
+                    match tracks[0].recording_mbid.as_deref() {
+                        Some(mbid) => navidrome::fetch_track_genres(mbid).await,
+                        None => None,
+                    }
                 }
             );
 
-            if let Some(genres) = &mb_genres {
+            if let Some(genres) = &nd_genres {
+                tags_text = format_tags(genres.clone(), &ACCEPTABLE_TAGS);
+                if !tags_text.is_empty() {
+                    tags_src = 'd';
+                }
+            }
+            if tags_text.is_empty()
+                && let Some(genres) = &mb_genres
+            {
                 tags_text = format_tags(genres.clone(), &ACCEPTABLE_TAGS);
                 if !tags_text.is_empty() {
                     tags_src = 'm';
@@ -2156,6 +2171,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
                 _ => "unknown",
             };
             let tags_txt = match tags {
+                'd' => "Navidrome",
                 'm' => "MusicBrainz",
                 'l' => "Last.fm (album)",
                 'n' => "none",
