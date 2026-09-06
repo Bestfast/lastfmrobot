@@ -680,6 +680,8 @@ async fn status_command(
             // fall back to Last.fm album tags (track-level toptags no longer exist).
             // The album.getInfo call below also doubles as the art fallback source.
             // Both are independent network calls, so they run concurrently.
+            // MB genres only resolve on expanded status — they are the slowest
+            // lookup and compact doesn't need them.
             let (album_info, mb_genres) = tokio::join!(
                 async {
                     if user.api_type() != ApiType::Librefm {
@@ -697,11 +699,18 @@ async fn status_command(
                         None
                     }
                 },
-                api_requester::fetch_mb_genres(
-                    tracks[0].recording_mbid.as_deref(),
-                    tracks[0].release_group_mbid.as_deref(),
-                    tracks[0].release_mbid.as_deref(),
-                )
+                async {
+                    if status_type == StatusType::Expanded {
+                        api_requester::fetch_mb_genres(
+                            tracks[0].recording_mbid.as_deref(),
+                            tracks[0].release_group_mbid.as_deref(),
+                            tracks[0].release_mbid.as_deref(),
+                        )
+                        .await
+                    } else {
+                        None
+                    }
+                }
             );
 
             if let Some(genres) = &mb_genres {
