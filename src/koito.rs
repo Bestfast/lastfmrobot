@@ -27,7 +27,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 
 // Same 10s budget as the ListenBrainz client — a slow Koito must not stall a
 // status past the point where the LB fallback would already have answered.
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+static CLIENT_HTTPS: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .https_only(true)
@@ -35,6 +35,24 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .unwrap()
 });
+
+// Plain HTTP for docker-internal instances (e.g. http://koito:4110 on a shared
+// compose network), where TLS terminates at the reverse proxy or not at all.
+static CLIENT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("LastFM Robot (Telegram bot)")
+        .build()
+        .unwrap()
+});
+
+fn client_for(url: &str) -> &'static reqwest::Client {
+    if url.starts_with("http://") {
+        &CLIENT_HTTP
+    } else {
+        &CLIENT_HTTPS
+    }
+}
 
 // album_id -> (title, release_mbid, image_url). Album metadata is effectively
 // immutable, so a long TTL is safe; the track itself (whose listen_count moves)
@@ -56,7 +74,7 @@ pub fn has_instance(uid: u64) -> bool {
 }
 
 async fn get_json(url: &str, inst: &KoitoInstance) -> Result<serde_json::Value, BoxError> {
-    let json = CLIENT
+    let json = client_for(inst.url)
         .get(url)
         .header("Authorization", format!("Token {}", inst.api_key))
         .send()
@@ -171,7 +189,14 @@ pub async fn fetch_recent_tracks(
     inst: &'static KoitoInstance,
     actual_limit: usize,
 ) -> Result<Vec<Track>, BoxError> {
-    let np_json = get_json(&format!("{}/apis/web/v1/now-playing", inst.url), inst).await?;
+    let np_json = match get_json(&format!("{}/apis/web/v1/now-playing", inst.url), inst).await
+    {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("koito: now-playing failed for {}: {e}", inst.url);
+            return Err(e);
+        }
+    };
     let mut np: Option<Track> = None;
     if np_json["currently_playing"].as_bool() == Some(true) {
         let track = track_from_full(inst, &np_json["track"], None, true).await;
@@ -183,11 +208,18 @@ pub async fn fetch_recent_tracks(
         return Ok(np.into_iter().collect());
     }
 
-    let listens = get_json(
+    let listens = match get_json(
         &format!("{}/apis/web/v1/listens?limit=3&period=all_time", inst.url),
         inst,
     )
-    .await?;
+    .await
+    {
+        Ok(json) => json,
+        Err(e) => {
+            log::warn!("koito: listens failed for {}: {e}", inst.url);
+            return Err(e);
+        }
+    };
     let items = listens["items"].as_array().cloned().unwrap_or_default();
 
     // Hydrate concurrently; track ids repeat, so the album cache usually covers.
@@ -217,6 +249,9 @@ pub async fn fetch_recent_tracks(
         if let Ok(Ok(track)) = handle.await {
             tracks.push(track);
         }
+    }
+    if tracks.is_empty() {
+        log::debug!("koito: no usable tracks for {} (NP + hydrations all missed)", inst.url);
     }
     Ok(tracks)
 }
