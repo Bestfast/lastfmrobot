@@ -9,7 +9,7 @@ use strum_macros::{Display, EnumString, IntoStaticStr};
 
 use crate::{config, consts, koito};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Track {
     pub name: String,
     pub album: Option<String>,

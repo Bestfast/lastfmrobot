@@ -453,6 +453,30 @@ fn format_tags(tags: Vec<String>, acceptable: &HashSet<String>) -> String {
         .join(" ")
 }
 
+/// Cover art chain for Koito-fed tracks: Navidrome > Koito > CAA (> Last.fm,
+/// which the caller tries next). Koito exposes no release-group mbid, so only
+/// the release mbid goes to Navidrome/CAA. The Koito image rides along as the
+/// `caa_url` slot of the Navidrome resolver — a Navidrome miss falls through
+/// to probing the Koito URL itself.
+async fn koito_cover_art(username: &str, track: &api_requester::Track) -> Option<String> {
+    let mut art = navidrome::resolve_cover_art_or_fallback(
+        username,
+        None,
+        track.release_mbid.as_deref(),
+        track.album_art_url.as_deref(),
+    )
+    .await;
+    if art.is_none()
+        && let Some(mbid) = track.release_mbid.as_deref()
+    {
+        art = api_requester::resolve_cover_art_url(Some(
+            &api_requester::caa_front_url_largest(mbid),
+        ))
+        .await;
+    }
+    art
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn status_command(
     bot: &Bot,
@@ -541,8 +565,9 @@ async fn status_command(
             if needs_cover {
                 let cover_start = std::time::Instant::now();
                 if koito {
-                    album_art_url = tracks[0].album_art_url.clone();
                     user_playcount = tracks[0].user_playcount;
+                    album_art_url =
+                        koito_cover_art(&user.account_username, &tracks[0]).await;
                 } else if user.api_type() == ApiType::Listenbrainz {
                     // Resolve the cover and fetch the play count concurrently — both are
                     // network calls, no reason to wait for them one after the other.
@@ -586,8 +611,14 @@ async fn status_command(
                 // only the bytes get warmed — no Navidrome/CAA probing, which also
                 // avoids Navidrome login noise when its creds are unset.
                 if koito {
+                    let account_username = user.account_username.clone();
+                    let track = tracks[0].clone();
                     tokio::spawn(async move {
-                        let _ = api_requester::cover_art_bytes(Some(&url)).await;
+                        if let Some(resolved) =
+                            koito_cover_art(&account_username, &track).await
+                        {
+                            let _ = api_requester::cover_art_bytes(Some(&resolved)).await;
+                        }
                     });
                 } else {
                     let account_username = user.account_username.clone();
