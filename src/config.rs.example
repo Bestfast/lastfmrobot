@@ -17,5 +17,15 @@ pub const NAVIDROME_USERS: &[&str] = &["Bestfast"];
 // `resources/album-placeholder.webp` in the matching Navidrome release when upgrading.
 // Empty disables the check (everything from Navidrome is trusted as real art).
 pub const NAVIDROME_PLACEHOLDER_SHA256: &str = "";
+// Koito instances per Telegram user (see config.rs). One entry per user that
+// should read now-playing + recents from their own Koito instead of
+// ListenBrainz. `uid` is the Telegram user id, `url` the Koito base URL,
+// `api_key` a key from Koito Settings -> API Keys.
+pub struct KoitoInstance {
+    pub uid: u64,
+    pub url: &'static str,
+    pub api_key: &'static str,
+}
+pub const KOITO_INSTANCES: &[KoitoInstance] = &[];
 // get one from https://github.com/notofonts/noto-cjk or something and put the path relative to the root dir of the project
 pub const FONT_FILE_PATH: &str = "NotoSansCJK-Medium.ttc";

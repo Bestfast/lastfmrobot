@@ -34,6 +34,7 @@ mod collage;
 mod config;
 mod consts;
 mod db;
+mod koito;
 mod navidrome;
 mod utils;
 
@@ -496,6 +497,7 @@ async fn status_command(
         &user.api_type(),
         prefer_cached,
         limit,
+        Some(user.tg_user_id),
     )
     .await;
 
@@ -519,18 +521,29 @@ async fn status_command(
             let mut album_art_url: Option<String> = None;
             let mut user_playcount = 0;
 
+            // Koito-mapped users already carry their cover + playcount on the
+            // track itself (see koito.rs) — no extra network calls needed.
+            let koito = koito::has_instance(user.tg_user_id);
+
             // What actually fed this status — reported by the ℹ️ button.
-            let mut plays_src = match user.api_type() {
-                ApiType::Listenbrainz => 'b',
-                ApiType::Lastfm => 'l',
-                ApiType::Librefm => 'r',
+            let mut plays_src = if koito {
+                'k'
+            } else {
+                match user.api_type() {
+                    ApiType::Listenbrainz => 'b',
+                    ApiType::Lastfm => 'l',
+                    ApiType::Librefm => 'r',
+                }
             };
             let mut art_src = 'n';
             let mut tags_src = 'n';
 
             if needs_cover {
                 let cover_start = std::time::Instant::now();
-                if user.api_type() == ApiType::Listenbrainz {
+                if koito {
+                    album_art_url = tracks[0].album_art_url.clone();
+                    user_playcount = tracks[0].user_playcount;
+                } else if user.api_type() == ApiType::Listenbrainz {
                     // Resolve the cover and fetch the play count concurrently — both are
                     // network calls, no reason to wait for them one after the other.
                     // Gated users resolve from Navidrome first (mbid -> local art),
@@ -568,48 +581,60 @@ async fn status_command(
                 // Telegram to fetch the image from the CDN. When the primary url is a
                 // miss, also warm the Last.fm track/album fallback so the click finds art
                 // (and bytes) already cached.
-                let account_username = user.account_username.clone();
-                let api_type = user.api_type();
-                let artist = tracks[0].artist.clone();
-                let track_name = tracks[0].name.clone();
-                let album = tracks[0].album.clone();
-                let release_group_mbid = tracks[0].release_group_mbid.clone();
-                let release_mbid = tracks[0].release_mbid.clone();
-                tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    let mut resolved = navidrome::resolve_cover_art_or_fallback(
-                        &account_username,
-                        release_group_mbid.as_deref(),
-                        release_mbid.as_deref(),
-                        Some(&url),
-                    )
-                    .await;
-
-                    if resolved.is_none() {
-                        resolved = api_requester::resolve_cover_art_fallback(
+                //
+                // Koito art is final (same precedence as the cover branch above), so
+                // only the bytes get warmed — no Navidrome/CAA probing, which also
+                // avoids Navidrome login noise when its creds are unset.
+                if koito {
+                    tokio::spawn(async move {
+                        let _ = api_requester::cover_art_bytes(Some(&url)).await;
+                    });
+                } else {
+                    let account_username = user.account_username.clone();
+                    let api_type = user.api_type();
+                    let artist = tracks[0].artist.clone();
+                    let track_name = tracks[0].name.clone();
+                    let album = tracks[0].album.clone();
+                    let release_group_mbid = tracks[0].release_group_mbid.clone();
+                    let release_mbid = tracks[0].release_mbid.clone();
+                    tokio::spawn(async move {
+                        let start = std::time::Instant::now();
+                        let mut resolved = navidrome::resolve_cover_art_or_fallback(
                             &account_username,
-                            &api_type,
-                            track_name.as_str(),
-                            artist.as_str(),
-                            album.as_deref(),
+                            release_group_mbid.as_deref(),
+                            release_mbid.as_deref(),
+                            Some(&url),
                         )
                         .await;
-                    }
 
-                    if let Some(resolved) = &resolved {
-                        let _ = api_requester::cover_art_bytes(Some(resolved)).await;
-                    }
-                    log::debug!(
-                        "status: bg cover warm took {:?} (resolved={})",
-                        start.elapsed(),
-                        resolved.is_some()
-                    );
-                });
+                        if resolved.is_none() {
+                            resolved = api_requester::resolve_cover_art_fallback(
+                                &account_username,
+                                &api_type,
+                                track_name.as_str(),
+                                artist.as_str(),
+                                album.as_deref(),
+                            )
+                            .await;
+                        }
+
+                        if let Some(resolved) = &resolved {
+                            let _ = api_requester::cover_art_bytes(Some(resolved)).await;
+                        }
+                        log::debug!(
+                            "status: bg cover warm took {:?} (resolved={})",
+                            start.elapsed(),
+                            resolved.is_some()
+                        );
+                    });
+                }
             }
 
             let mut tags_text: String = "".to_string();
 
-            if user.api_type() == ApiType::Listenbrainz && !needs_cover {
+            if koito {
+                user_playcount = tracks[0].user_playcount;
+            } else if user.api_type() == ApiType::Listenbrainz && !needs_cover {
                 user_playcount = api_requester::fetch_listenbrainz_track_playcount(
                     user.account_username.as_str(),
                     tracks[0].artist.as_str(),
@@ -705,6 +730,9 @@ async fn status_command(
                     'c'
                 } else if url.contains("getCoverArt") {
                     'd'
+                } else if url.contains("/image/") {
+                    // Koito serves covers from its own `/image/<uuid>/…` route.
+                    'k'
                 } else if url.contains("lastfm") {
                     'l'
                 } else {
@@ -965,7 +993,8 @@ async fn set_command(
     let api_type_str = arg_splits.get(1).cloned().unwrap_or_default();
     let api_type = api_type_str.parse().unwrap_or(ApiType::Lastfm);
 
-    let recent_tracks = api_requester::fetch_recent_tracks(username, &api_type, false, 1).await;
+    let recent_tracks =
+        api_requester::fetch_recent_tracks(username, &api_type, false, 1, Some(from.id.0)).await;
 
     let buttons = [ApiType::Lastfm, ApiType::Listenbrainz, ApiType::Librefm]
         .iter()
@@ -2070,6 +2099,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
             let plays_txt = match plays {
                 'b' => "ListenBrainz",
                 'f' => "Last.fm (fallback)",
+                'k' => "Koito",
                 'l' => "Last.fm",
                 'r' => "Libre.fm",
                 _ => "unknown",
@@ -2077,6 +2107,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
             let art_txt = match art {
                 'c' => "Cover Art Archive (MusicBrainz)",
                 'd' => "Navidrome",
+                'k' => "Koito",
                 'l' => "Last.fm",
                 'n' => "none",
                 _ => "unknown",

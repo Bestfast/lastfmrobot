@@ -7,7 +7,7 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use serde_json::Value;
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
-use crate::{config, consts};
+use crate::{config, consts, koito};
 
 #[derive(Debug)]
 pub struct Track {
@@ -1140,12 +1140,15 @@ async fn fetch_recent_tracks_lastfm(
     parse_lastfm_tracks(&json["recenttracks"]["track"])
 }
 
-// Get recent tracks for a given user
+// Get recent tracks for a given user. A mapped Koito instance goes first and the
+// whole previous chain (ListenBrainz -> Last.fm) becomes the fallback, so a
+// down/empty Koito degrades to exactly the old behaviour.
 pub async fn fetch_recent_tracks(
     username: &str,
     api_type: &ApiType,
     prefer_cached: bool,
     actual_limit: usize,
+    tg_user_id: Option<u64>,
 ) -> Result<Vec<Track>, BoxError> {
     let cache_control = if prefer_cached {
         "max-stale=300"
@@ -1153,17 +1156,31 @@ pub async fn fetch_recent_tracks(
         "no-cache, must-revalidate"
     };
 
-    match api_type {
-        ApiType::Listenbrainz => or_lastfm(
-            fetch_recent_tracks_listenbrainz(username, cache_control, actual_limit),
-            fetch_recent_tracks_lastfm(username, &ApiType::Lastfm, cache_control),
-            |tracks| !tracks.is_empty(),
-        )
-        .await,
+    let fallback = async {
+        match api_type {
+            ApiType::Listenbrainz => or_lastfm(
+                fetch_recent_tracks_listenbrainz(username, cache_control, actual_limit),
+                fetch_recent_tracks_lastfm(username, &ApiType::Lastfm, cache_control),
+                |tracks| !tracks.is_empty(),
+            )
+            .await,
 
-        ApiType::Librefm | ApiType::Lastfm => {
-            fetch_recent_tracks_lastfm(username, api_type, cache_control).await
+            ApiType::Librefm | ApiType::Lastfm => {
+                fetch_recent_tracks_lastfm(username, api_type, cache_control).await
+            }
         }
+    };
+
+    match tg_user_id.and_then(koito::instance_for_uid) {
+        Some(inst) => {
+            or_lastfm(
+                koito::fetch_recent_tracks(inst, actual_limit),
+                fallback,
+                |tracks| !tracks.is_empty(),
+            )
+            .await
+        }
+        None => fallback.await,
     }
 }
 
