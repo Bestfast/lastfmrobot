@@ -94,93 +94,57 @@ async fn login() -> Option<String> {
     Some(token)
 }
 
+struct AlbumHit {
+    id: String,
+    genres: Vec<String>,
+}
+
 enum Lookup {
-    Found(String),
+    Found(AlbumHit),
     NoAlbum,
     Unreachable,
 }
 
-/// Genres for a recording mbid from Navidrome's file tags (`/api/song` filtered
-/// on `mbz_track_id` → `genres[].name`, falling back to the single `genre`
-/// string). Keyed by recording mbid, so it serves any user, not just gated
-/// ones. Hits (even genre-less songs) are cached in users.sqlite; a missing
-/// song or unreachable server stays uncached and retries next status.
-pub async fn fetch_track_genres(recording_mbid: &str) -> Option<Vec<String>> {
-    let key = format!("nd:track:{recording_mbid}");
-    if let Some(cached) = db::DB.lock().unwrap().get_mb_genres(&key) {
-        return Some(cached);
-    }
-    let Some(token) = login().await else {
-        return None;
-    };
-
-    let filters = format!("{{\"mbz_track_id\":\"{recording_mbid}\"}}");
-    let mut url = match Url::parse(&format!("{}/api/song", config::NAVIDROME_URL)) {
-        Ok(url) => url,
-        Err(_) => return None,
-    };
-    url.query_pairs_mut()
-        .append_pair("_filters", &filters)
-        .append_pair("_end", "1");
-
-    let resp = match CLIENT_ND
-        .get(url)
-        .header(X_ND_AUTHORIZATION.clone(), format!("Bearer {token}"))
-        .send()
-        .await
+/// Genres for a track from Navidrome's album rows, tried by release-group mbid
+/// then release mbid (the `/api/album` mbid filters work, unlike the song
+/// filters). Keyed by album mbid, so it serves any user, not just gated ones.
+/// Found rows (even genre-less ones) are cached in users.sqlite; a missing row
+/// or unreachable server stays uncached and retries next status.
+pub async fn fetch_album_genres(
+    rg_mbid: Option<&str>,
+    release_mbid: Option<&str>,
+) -> Option<Vec<String>> {
+    for (filter_field, mbid) in [
+        ("mbz_release_group_id", rg_mbid),
+        ("mbz_album_id", release_mbid),
+    ]
+    .into_iter()
+    .filter_map(|(f, m)| m.map(|m| (f, m)))
     {
-        Ok(resp) => resp,
-        Err(e) => {
-            log::warn!("navidrome: song lookup ({recording_mbid}) failed: {e}");
-            return None;
+        let key = format!("nd:album:{filter_field}:{mbid}");
+        if let Some(cached) = db::DB.lock().unwrap().get_mb_genres(&key) {
+            if !cached.is_empty() {
+                return Some(cached);
+            }
+            continue;
         }
-    };
-    if !resp.status().is_success() {
-        log::warn!(
-            "navidrome: song lookup ({recording_mbid}) returned {}",
-            resp.status()
-        );
-        return None;
-    }
-    let json: serde_json::Value = match resp.json().await {
-        Ok(json) => json,
-        Err(e) => {
-            log::warn!("navidrome: song lookup ({recording_mbid}) json parse failed: {e}");
-            return None;
+        match lookup_album(filter_field, mbid).await {
+            Lookup::Found(hit) => {
+                db::DB
+                    .lock()
+                    .unwrap()
+                    .store_mb_genres(&key, &hit.genres)
+                    .ok();
+                if !hit.genres.is_empty() {
+                    return Some(hit.genres);
+                }
+            }
+            // No row / unreachable: leave uncached and try the next mbid (a
+            // rescan may add the album later; the server may be back).
+            Lookup::NoAlbum | Lookup::Unreachable => {}
         }
-    };
-
-    let song = json.as_array().and_then(|a| a.first());
-    let mut genres: Vec<String> = song
-        .and_then(|s| s.get("genres"))
-        .and_then(|g| g.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|g| g["name"].as_str().map(str::to_string))
-        .filter(|g| !g.is_empty())
-        .collect();
-    if genres.is_empty()
-        && let Some(genre) = song
-            .and_then(|s| s.get("genre"))
-            .and_then(|g| g.as_str())
-            .map(str::trim)
-            .filter(|g| !g.is_empty())
-    {
-        genres.push(genre.to_string());
     }
-    // Song found (even genre-less) → cache; no song → leave uncached so a
-    // later library rescan gets picked up.
-    if song.is_some() {
-        db::DB
-            .lock()
-            .unwrap()
-            .store_mb_genres(&key, &genres)
-            .ok();
-        Some(genres)
-    } else {
-        log::debug!("navidrome: no song for mbz_track_id={recording_mbid}");
-        None
-    }
+    None
 }
 
 // Native API `GET /api/album` with a field filter returns the album(s) whose
@@ -190,7 +154,7 @@ pub async fn fetch_track_genres(recording_mbid: &str) -> Option<Vec<String>> {
 // ListenBrainz hands out both, so the caller picks the field matching the mbid
 // it holds. `_end=1` keeps the first row only; album ids are persistent
 // (PID-derived), so stable across restarts.
-async fn lookup_album_id(filter_field: &str, mbid: &str) -> Lookup {
+async fn lookup_album(filter_field: &str, mbid: &str) -> Lookup {
     let Some(token) = login().await else {
         return Lookup::Unreachable;
     };
@@ -232,18 +196,45 @@ async fn lookup_album_id(filter_field: &str, mbid: &str) -> Lookup {
         }
     };
 
-    match json
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|a| a.get("id"))
-        .and_then(|id| id.as_str())
-    {
-        Some(id) => Lookup::Found(id.to_string()),
+    match json.as_array().and_then(|a| a.first()) {
+        Some(album) => match album.get("id").and_then(|id| id.as_str()) {
+            Some(id) => Lookup::Found(AlbumHit {
+                id: id.to_string(),
+                genres: album_genres(album),
+            }),
+            None => {
+                log::debug!("navidrome: no album for {filter_field}={mbid}");
+                Lookup::NoAlbum
+            }
+        },
         None => {
             log::debug!("navidrome: no album for {filter_field}={mbid}");
             Lookup::NoAlbum
         }
     }
+}
+
+/// Genres for an album row: `genres[].name`, falling back to the single
+/// `genre` string.
+fn album_genres(album: &serde_json::Value) -> Vec<String> {
+    let mut genres: Vec<String> = album
+        .get("genres")
+        .and_then(|g| g.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g["name"].as_str().map(str::to_string))
+        .filter(|g| !g.is_empty())
+        .collect();
+    if genres.is_empty()
+        && let Some(genre) = album
+            .get("genre")
+            .and_then(|g| g.as_str())
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+    {
+        genres.push(genre.to_string());
+    }
+    genres
 }
 
 // Subsonic `getCoverArt` with token auth — the `t`/`s` params carry the auth so
@@ -279,8 +270,8 @@ async fn resolve_cover_art_inner(filter_field: &str, mbid: &str) -> Option<Strin
         None => {}
     }
 
-    let album_id = match lookup_album_id(filter_field, mbid).await {
-        Lookup::Found(id) => id,
+    let album_id = match lookup_album(filter_field, mbid).await {
+        Lookup::Found(hit) => hit.id,
         Lookup::NoAlbum => {
             db::DB.lock().unwrap().store_cover_art(&key, None).ok();
             log::debug!("navidrome: no album for {filter_field}={mbid}, negative-cached");

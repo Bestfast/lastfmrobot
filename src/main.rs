@@ -713,9 +713,14 @@ async fn status_command(
                     }
                 },
                 async {
-                    match tracks[0].recording_mbid.as_deref() {
-                        Some(mbid) => navidrome::fetch_track_genres(mbid).await,
-                        None => None,
+                    match (
+                        tracks[0].release_group_mbid.as_deref(),
+                        tracks[0].release_mbid.as_deref(),
+                    ) {
+                        (None, None) => None,
+                        (rg, release) => {
+                            navidrome::fetch_album_genres(rg, release).await
+                        }
                     }
                 }
             );
