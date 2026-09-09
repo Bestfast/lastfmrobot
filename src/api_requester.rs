@@ -432,7 +432,7 @@ pub fn cover_art_candidates(url: &str) -> Vec<String> {
 // restarts — skip the probing entirely. Entries are keyed on the *canonical* image
 // (CAA release mbid or the Last.fm image hash), so a hit works no matter which size
 // variant the API happened to hand back.
-fn cover_art_cache_key(url: &str) -> String {
+pub fn cover_art_cache_key(url: &str) -> String {
     if let Some(mbid) = url
         .split_once("coverartarchive.org/release/")
         .and_then(|(_, rest)| rest.split('/').next())

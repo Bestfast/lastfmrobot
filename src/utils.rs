@@ -199,6 +199,7 @@ pub async fn send_or_edit_photo(
             ))
             .caption(media.caption.unwrap_or_default())
             .parse_mode(ParseMode::Html)
+            .show_caption_above_media(media.show_caption_above_media)
         } else {
             media.parse_mode(ParseMode::Html)
         };

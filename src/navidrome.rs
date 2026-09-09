@@ -45,8 +45,11 @@ static TOKEN_CACHE: LazyLock<moka::future::Cache<String, String>> = LazyLock::ne
 const SUBSONIC_SALT: &str = "lastfmrobot-nd";
 
 /// Whether Navidrome should be the cover art source for this scrobbling username.
+/// Also requires usable credentials — an URL without them just produces 401s
+/// (and 429s from Navidrome's login rate limit) on every status.
 pub fn enabled_for(username: &str) -> bool {
     !config::NAVIDROME_URL.is_empty()
+        && !config::NAVIDROME_USERNAME.is_empty()
         && config::NAVIDROME_USERS
             .iter()
             .any(|u| u.eq_ignore_ascii_case(username))
@@ -107,9 +110,10 @@ enum Lookup {
 
 /// Genres for a track from Navidrome's album rows, tried by release-group mbid
 /// then release mbid (the `/api/album` mbid filters work, unlike the song
-/// filters). Keyed by album mbid, so it serves any user, not just gated ones.
-/// Found rows (even genre-less ones) are cached in users.sqlite; a missing row
-/// or unreachable server stays uncached and retries next status.
+/// filters). Callers gate this on `enabled_for` — Navidrome is only ever
+/// queried for the gated user. Keyed by album mbid; found rows (even
+/// genre-less ones) are cached in users.sqlite; a missing row or unreachable
+/// server stays uncached and retries next status.
 pub async fn fetch_album_genres(
     rg_mbid: Option<&str>,
     release_mbid: Option<&str>,

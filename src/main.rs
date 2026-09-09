@@ -101,10 +101,10 @@ static COMMAND_USAGE_MAP: LazyLock<HashMap<String, &str>> = LazyLock::new(|| {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // pretty_env_logger's default filter is `Off` when RUST_LOG isn't set, so nothing
-    // (not even errors) gets logged out of the box. Default to `info` instead, still
-    // overridable via RUST_LOG.
+    // (not even errors) gets logged out of the box. Default to `debug` instead, still
+    // overridable via RUST_LOG (the compose file pins it explicitly anyway).
     pretty_env_logger::formatted_timed_builder()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .parse_env("RUST_LOG")
         .init();
 
@@ -477,6 +477,51 @@ async fn koito_cover_art(username: &str, track: &api_requester::Track) -> Option
     art
 }
 
+/// A Telegram file_id for the given cover. Inline media edits can't carry fresh
+/// uploads and Telegram's own fetcher often can't reach the art CDNs
+/// (`Api(FailedToGetUrlContent)` — the CAA chain redirects to archive.org), so
+/// inline statuses render via file_id: the bot downloads the image itself
+/// (which works where Telegram's fetcher fails) and uploads it to the dump chat
+/// once to mint the file_id, which is then persisted in sqlite — one dump-chat
+/// message per unique cover, served from cache afterwards.
+async fn inline_cover_file_id(
+    bot: &Bot,
+    album_art_url: Option<&str>,
+) -> Result<Option<teloxide::types::FileId>, Box<dyn Error + Send + Sync>> {
+    if config::INLINE_IMAGES_DUMP_CHAT_ID.is_empty() {
+        log::debug!("status: no dump chat configured, inline art falls back to url");
+        return Ok(None);
+    }
+    let url = album_art_url.unwrap_or(consts::LASTFM_STAR_URL);
+    let key = api_requester::cover_art_cache_key(url);
+
+    if let Some(file_id) = DB.lock().unwrap().get_inline_file_id(&key) {
+        log::debug!("status: inline file_id cache hit for {key}");
+        return Ok(Some(teloxide::types::FileId(file_id)));
+    }
+
+    let input = if let Some(bytes) = api_requester::cover_art_bytes(Some(url)).await {
+        InputFile::memory(bytes)
+    } else {
+        // Last resort: the bot-side fetch failed too; let Telegram try.
+        InputFile::url(Url::parse(url)?)
+    };
+    let dump_msg = bot
+        .send_photo(config::INLINE_IMAGES_DUMP_CHAT_ID.to_string(), input)
+        .await?;
+    let file_id = dump_msg
+        .photo()
+        .and_then(|sizes| sizes.last().map(|photo| photo.file.id.clone()))
+        .ok_or("dump chat send returned no photo")?;
+
+    DB.lock()
+        .unwrap()
+        .store_inline_file_id(&key, &file_id.0)
+        .ok();
+    log::debug!("status: minted inline file_id for {key}");
+    Ok(Some(file_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn status_command(
     bot: &Bot,
@@ -499,7 +544,17 @@ async fn status_command(
 
     let from = utils::choose_the_from(msg, inline_from);
 
-    let status_type = if status_type_param == StatusType::Compact && user.cover_shown {
+    // Album art inline is its own preference: inline media edits can't carry
+    // fresh uploads and Telegram's own URL fetcher is unreliable, so inline
+    // art renders via a minted-and-cached file_id (see inline_cover_file_id).
+    // The preference sends the cover up front; otherwise the 🖼️ button resolves
+    // it on click, same as regular chats, which keep the always-show-album-art
+    // preference for their up-front render.
+    let inline = msg.is_none();
+    let inline_cover = inline && user.inline_cover_shown;
+    let status_type = if status_type_param == StatusType::Compact
+        && (user.cover_shown || inline_cover)
+    {
         StatusType::CompactWithCover
     } else {
         status_type_param
@@ -539,8 +594,9 @@ async fn status_command(
 
             // Resolving cover art means probing the network (up to ~2s cold). A plain
             // Compact status doesn't render the art, so resolve it in the background to
-            // warm the cache and send the text right away; the cover is only awaited when
-            // it's actually going to be shown (cover/expanded/photo).
+            // warm the cache and send the text right away; the cover is only awaited
+            // when it's actually going to be shown (cover/expanded/photo, or an inline
+            // status with the inline preference on).
             let needs_cover = status_type != StatusType::Compact || msg_is_photo;
             let mut album_art_url: Option<String> = None;
             let mut user_playcount = 0;
@@ -605,7 +661,8 @@ async fn status_command(
                 // later cover click can upload the bytes directly instead of waiting on
                 // Telegram to fetch the image from the CDN. When the primary url is a
                 // miss, also warm the Last.fm track/album fallback so the click finds art
-                // (and bytes) already cached.
+                // (and bytes) already cached. Inline text statuses warm too — the
+                // click mints its file_id from these bytes.
                 //
                 // Koito art is final (same precedence as the cover branch above), so
                 // only the bytes get warmed — no Navidrome/CAA probing, which also
@@ -713,6 +770,12 @@ async fn status_command(
                     }
                 },
                 async {
+                    // Navidrome (music.bestfast.eu.org) must only ever be
+                    // queried for the gated user; everyone else gets genres
+                    // from MusicBrainz / Last.fm below.
+                    if !navidrome::enabled_for(&user.account_username) {
+                        return None;
+                    }
                     match (
                         tracks[0].release_group_mbid.as_deref(),
                         tracks[0].release_mbid.as_deref(),
@@ -875,7 +938,8 @@ async fn status_command(
                 StatusType::Compact => {
                     // Offer the cover button whenever the track has an art url to try; the
                     // confirmation runs in the background and the cache is usually warm by
-                    // the time the button is pressed.
+                    // the time the button is pressed. Inline statuses resolve the click
+                    // through the minted file_id instead of a plain url render.
                     if tracks[0].album_art_url.is_some() {
                         keyboard[0].push(InlineKeyboardButton::callback(
                             "🖼️",
@@ -918,11 +982,22 @@ async fn status_command(
                 || msg_is_photo
             {
                 let send_start = std::time::Instant::now();
-                let media = if let Some(bytes) =
+                let media = if msg.is_none() {
+                    // Inline: Telegram's fetcher can't be trusted with the url
+                    // (FailedToGetUrlContent) and fresh uploads are rejected for
+                    // inline edits — render via the minted-and-cached file_id.
+                    // Without a configured dump chat, fall back to a URL render.
+                    match inline_cover_file_id(bot, album_art_url.as_deref()).await? {
+                        Some(file_id) => InputMediaPhoto::new(InputFile::file_id(file_id)),
+                        None => InputMediaPhoto::new(InputFile::url(Url::parse(
+                            album_art_url.as_deref().unwrap_or(consts::LASTFM_STAR_URL),
+                        )?)),
+                    }
+                } else if let Some(bytes) =
                     api_requester::cover_art_bytes(album_art_url.as_deref()).await
                 {
-                    // Bytes already cached (warmed in the background): upload directly, no
-                    // Telegram-side CDN fetch.
+                    // Regular chats accept uploaded bytes directly (no Telegram-side CDN
+                    // fetch).
                     InputMediaPhoto::new(InputFile::memory(bytes))
                 } else {
                     InputMediaPhoto::new(InputFile::url(Url::parse(
@@ -1074,7 +1149,14 @@ async fn set_command(
 
     let text = match recent_tracks {
         Ok(_) => {
-            let new_user = db::User::new(from.id.0, username.to_owned(), &api_type, false, false);
+            let new_user = db::User::new(
+                from.id.0,
+                username.to_owned(),
+                &api_type,
+                false,
+                false,
+                false,
+            );
 
             DB.lock().unwrap().upsert_user(&new_user)?;
             format!(
@@ -1133,6 +1215,14 @@ async fn preferences_command(
             user.cover_shown = false;
             DB.lock().unwrap().upsert_user(&user)?;
         }
+        "inline_cover_show" => {
+            user.inline_cover_shown = true;
+            DB.lock().unwrap().upsert_user(&user)?;
+        }
+        "inline_cover_hide" => {
+            user.inline_cover_shown = false;
+            DB.lock().unwrap().upsert_user(&user)?;
+        }
         "unset" => {
             DB.lock().unwrap().delete_user(user.tg_user_id).unwrap();
             utils::send_or_edit_message(bot, consts::UNSET, msg, None, true, None, true).await?;
@@ -1171,6 +1261,22 @@ async fn preferences_command(
                 "cover_hide"
             } else {
                 "cover_show"
+            }
+        ),
+    ));
+
+    buttons.push(InlineKeyboardButton::callback(
+        format!(
+            "{} Album art in inline status",
+            if user.inline_cover_shown { "✅" } else { "⬜" }
+        ),
+        format!(
+            "{} preferences {}",
+            from.id,
+            if user.inline_cover_shown {
+                "inline_cover_hide"
+            } else {
+                "inline_cover_show"
             }
         ),
     ));

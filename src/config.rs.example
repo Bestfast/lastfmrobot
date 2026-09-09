@@ -1,6 +1,9 @@
 pub const BOT_TOKEN: &str = "";
 pub const LASTFM_API_KEY: &str = "";
 pub const OWNER_ID: &str = "";
+// Chat used to mint reusable file_ids for inline album art (one upload per
+// unique cover). Can be overridden with the INLINE_IMAGES_DUMP_CHAT_ID env
+// var; setting the env var to an empty value disables minting.
 pub const INLINE_IMAGES_DUMP_CHAT_ID: &str = "";
 pub const AMPLITUDE_KEY: &str = "";
 // Navidrome as an alternative cover art source. Only users in NAVIDROME_USERS
