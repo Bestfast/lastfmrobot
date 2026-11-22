@@ -30,5 +30,19 @@ pub struct KoitoInstance {
     pub api_key: &'static str,
 }
 pub const KOITO_INSTANCES: &[KoitoInstance] = &[];
+// teal.fm (AT Protocol) as the metadata source for a mapped Telegram user.
+// Now-playing + recents come from that user's own teal.fm repo - plays are
+// mbid-tagged, so the album is exact - while cover art stays on the
+// Navidrome/CAA chain and the play count stays on the user's Koito. Needs no
+// key: the records are public. `uid` is the Telegram user id (users.sqlite
+// tg_user_id), `handle` the atproto handle from https://teal.fm/profile/<handle>.
+pub struct TealUser {
+    pub uid: u64,
+    pub handle: &'static str,
+}
+pub const TEAL_USERS: &[TealUser] = &[TealUser {
+    uid: 364870695,
+    handle: "bestfast.bsky.social",
+}];
 // get one from https://github.com/notofonts/noto-cjk or something and put the path relative to the root dir of the project
 pub const FONT_FILE_PATH: &str = "NotoSansCJK-Medium.ttc";

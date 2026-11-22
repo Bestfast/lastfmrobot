@@ -7,7 +7,7 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use serde_json::Value;
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
-use crate::{config, consts, koito};
+use crate::{config, consts, koito, teal};
 
 #[derive(Debug, Clone)]
 pub struct Track {
@@ -1183,16 +1183,32 @@ pub async fn fetch_recent_tracks(
         }
     };
 
-    match tg_user_id.and_then(koito::instance_for_uid) {
-        Some(inst) => {
+    let koito_or_fallback = async {
+        match tg_user_id.and_then(koito::instance_for_uid) {
+            Some(inst) => {
+                or_lastfm(
+                    koito::fetch_recent_tracks(inst, actual_limit),
+                    fallback,
+                    |tracks| !tracks.is_empty(),
+                )
+                .await
+            }
+            None => fallback.await,
+        }
+    };
+
+    // teal.fm leads for a mapped user (mbid-tagged plays -> exact album), with
+    // Koito and then the configured service as fallbacks when it is down.
+    match tg_user_id.and_then(teal::user_for_uid) {
+        Some(mapped) => {
             or_lastfm(
-                koito::fetch_recent_tracks(inst, actual_limit),
-                fallback,
+                teal::fetch_recent_tracks(mapped.handle, actual_limit),
+                koito_or_fallback,
                 |tracks| !tracks.is_empty(),
             )
             .await
         }
-        None => fallback.await,
+        None => koito_or_fallback.await,
     }
 }
 

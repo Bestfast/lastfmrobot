@@ -36,6 +36,7 @@ mod consts;
 mod db;
 mod koito;
 mod navidrome;
+mod teal;
 mod utils;
 
 type Bot = Throttle<teloxide::Bot>;
@@ -604,9 +605,15 @@ async fn status_command(
             // Koito-mapped users already carry their cover + playcount on the
             // track itself (see koito.rs) — no extra network calls needed.
             let koito = koito::has_instance(user.tg_user_id);
+            // teal.fm-mapped users take the track (exact album + mbids) from
+            // teal.fm, so covers stay on the Navidrome/CAA chain and the play
+            // count is asked to Koito separately instead of riding the track.
+            let is_teal = teal::has_user(user.tg_user_id);
 
             // What actually fed this status — reported by the ℹ️ button.
-            let mut plays_src = if koito {
+            let mut plays_src = if is_teal {
+                't'
+            } else if koito {
                 'k'
             } else {
                 match user.api_type() {
@@ -620,7 +627,7 @@ async fn status_command(
 
             if needs_cover {
                 let cover_start = std::time::Instant::now();
-                if koito {
+                if koito && !is_teal {
                     user_playcount = tracks[0].user_playcount;
                     album_art_url =
                         koito_cover_art(&user.account_username, &tracks[0]).await;
@@ -635,15 +642,29 @@ async fn status_command(
                         tracks[0].release_mbid.as_deref(),
                         tracks[0].album_art_url.as_deref(),
                     );
-                    let playcount_fut = api_requester::fetch_listenbrainz_track_playcount(
-                        user.account_username.as_str(),
-                        tracks[0].artist.as_str(),
-                        tracks[0].name.as_str(),
-                        tracks[0].recording_mbid.as_deref(),
-                    );
+                    // teal.fm has no play counts: they stay on the user's Koito.
+                    let playcount_fut = async {
+                        if is_teal {
+                            match koito::instance_for_uid(user.tg_user_id) {
+                                Some(inst) => koito::playcount_for(inst, &tracks[0])
+                                    .await
+                                    .unwrap_or_default(),
+                                None => 0,
+                            }
+                        } else {
+                            api_requester::fetch_listenbrainz_track_playcount(
+                                user.account_username.as_str(),
+                                tracks[0].artist.as_str(),
+                                tracks[0].name.as_str(),
+                                tracks[0].recording_mbid.as_deref(),
+                            )
+                            .await
+                            .unwrap_or_default()
+                        }
+                    };
                     let (resolved, playcount) = tokio::join!(resolve_fut, playcount_fut);
                     album_art_url = resolved;
-                    user_playcount = playcount.unwrap_or_default();
+                    user_playcount = playcount;
                 } else {
                     album_art_url = api_requester::resolve_cover_art_url(
                         tracks[0].album_art_url.as_deref(),
@@ -720,7 +741,13 @@ async fn status_command(
 
             let mut tags_text: String = "".to_string();
 
-            if koito {
+            if is_teal {
+                if let Some(inst) = koito::instance_for_uid(user.tg_user_id) {
+                    user_playcount = koito::playcount_for(inst, &tracks[0])
+                        .await
+                        .unwrap_or_default();
+                }
+            } else if koito {
                 user_playcount = tracks[0].user_playcount;
             } else if user.api_type() == ApiType::Listenbrainz && !needs_cover {
                 user_playcount = api_requester::fetch_listenbrainz_track_playcount(
@@ -2271,6 +2298,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery) -> Result<(), Box<dyn Erro
                 'k' => "Koito",
                 'l' => "Last.fm",
                 'r' => "Libre.fm",
+                't' => "teal.fm",
                 _ => "unknown",
             };
             let art_txt = match art {

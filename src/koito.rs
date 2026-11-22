@@ -268,6 +268,48 @@ pub async fn fetch_recent_tracks(
     Ok(tracks)
 }
 
+/// Play count for a track that was fed by another source (teal.fm): the
+/// numbers still belong to the user's Koito. Matches on the recording mbid
+/// first, then on artist+title, against now-playing plus the newest listens.
+/// `None` (unknown/zero) lets the caller keep its existing fallbacks.
+pub async fn playcount_for(inst: &'static KoitoInstance, track: &Track) -> Option<u64> {
+    let recent = match fetch_recent_tracks(inst, 3).await {
+        Ok(tracks) => tracks,
+        Err(e) => {
+            log::warn!("koito: playcount lookup failed for {}: {e}", inst.url);
+            return None;
+        }
+    };
+    let hit = recent.iter().find(|c| same_track(c, track))?;
+    (hit.user_playcount > 0).then_some(hit.user_playcount)
+}
+
+fn norm_mbid(mbid: Option<&str>) -> Option<String> {
+    mbid.map(|m| {
+        m.trim()
+            .trim_start_matches("mbid:")
+            .trim_start_matches("MBID:")
+            .trim()
+            .to_ascii_lowercase()
+    })
+    .filter(|m| !m.is_empty())
+}
+
+fn same_track(a: &Track, b: &Track) -> bool {
+    match (
+        norm_mbid(a.recording_mbid.as_deref()),
+        norm_mbid(b.recording_mbid.as_deref()),
+    ) {
+        // Both tagged: the mbid decides - a different recording is a different track.
+        (Some(x), Some(y)) => x == y,
+        // One side untagged: fall back to the credit.
+        _ => {
+            a.name.trim().eq_ignore_ascii_case(b.name.trim())
+                && a.artist.trim().eq_ignore_ascii_case(b.artist.trim())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +354,58 @@ mod tests {
     fn time_parses_rfc3339() {
         assert_eq!(parse_time("2026-09-06T18:34:45Z"), Some(1788719685));
         assert_eq!(parse_time("not a time"), None);
+    }
+
+    fn track(name: &str, artist: &str, mbid: Option<&str>) -> Track {
+        Track {
+            name: name.to_string(),
+            album: None,
+            artist: artist.to_string(),
+            album_art_url: None,
+            date: None,
+            duration: 0,
+            listeners: 0,
+            playcount: 0,
+            user_playcount: 0,
+            user_loved: false,
+            now_playing: false,
+            tags: None,
+            recording_mbid: mbid.map(str::to_string),
+            release_mbid: None,
+            release_group_mbid: None,
+        }
+    }
+
+    #[test]
+    fn tracks_match_on_mbid_even_with_different_titles() {
+        assert!(same_track(
+            &track(
+                "Danza dei soldi",
+                "Tony Boy",
+                Some("mbid:b3c6c43c-9985-4dbe-abe5-63268f79c5d4")
+            ),
+            &track(
+                "Danza Dei Soldi (Remaster)",
+                "Tony Boy",
+                Some("B3C6C43C-9985-4DBE-ABE5-63268F79C5D4")
+            ),
+        ));
+    }
+
+    #[test]
+    fn tracks_fall_back_to_artist_and_title() {
+        assert!(same_track(
+            &track("Underdog", "Eve", None),
+            &track(" underdog ", "EVE", None),
+        ));
+        assert!(!same_track(
+            &track("Underdog", "Eve", None),
+            &track("Underdog", "Someone Else", None),
+        ));
+        // Different mbids are not the same recording, even if the text matches.
+        assert!(!same_track(
+            &track("Underdog", "Eve", Some("mbid:aaa")),
+            &track("Underdog", "Eve", Some("mbid:bbb")),
+        ));
     }
 }
