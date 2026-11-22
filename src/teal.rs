@@ -3,7 +3,11 @@ use std::{error::Error, sync::LazyLock, time::Duration};
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 
-use crate::{api_requester::Track, config, config::TealUser};
+use crate::{
+    api_requester::{Track, caa_front_url_largest},
+    config,
+    config::TealUser,
+};
 
 // teal.fm as a now-playing + recents source (AT Protocol).
 //
@@ -17,9 +21,10 @@ use crate::{api_requester::Track, config, config::TealUser};
 // Records are mbid-first, which is the point of this source: `releaseName` +
 // `releaseMbId` carry the exact album, so Navidrome/CAA resolve the right
 // cover and the status prints the real album instead of a last.fm/LB guess.
-// Cover art is deliberately left empty here - covers stay on the
-// Navidrome/CAA chain in main.rs. teal.fm has no play counts either; those
-// stay on the user's Koito (see koito::playcount_for).
+// teal.fm serves no art of its own, so the track carries a Cover Art Archive
+// probe url derived from its release mbid - exactly what the ListenBrainz
+// parser hands the Navidrome/CAA chain. teal.fm has no play counts either;
+// those stay on the user's Koito (see koito::playcount_for).
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -97,12 +102,15 @@ fn parse_item(item: &serde_json::Value, now_playing: bool) -> Option<Track> {
         .map(str::trim)
         .filter(|a| !a.is_empty())
         .map(str::to_string);
+    let release_mbid = parse_mbid(&item["releaseMbId"]);
+    // teal.fm has no art endpoint: hand the chain the CAA probe url for the
+    // exact release, so Navidrome can answer first and CAA afterwards.
+    let album_art_url = release_mbid.as_deref().map(caa_front_url_largest);
     Some(Track {
         name: name.to_string(),
         album,
         artist,
-        // Covers come from Navidrome/CAA, never from here.
-        album_art_url: None,
+        album_art_url,
         date: parse_time(item["playedTime"].as_str()),
         duration: item["duration"].as_u64().unwrap_or_default(),
         listeners: 0,
@@ -113,7 +121,7 @@ fn parse_item(item: &serde_json::Value, now_playing: bool) -> Option<Track> {
         now_playing,
         tags: None,
         recording_mbid: parse_mbid(&item["recordingMbId"]),
-        release_mbid: parse_mbid(&item["releaseMbId"]),
+        release_mbid,
         release_group_mbid: None,
     })
 }
@@ -283,7 +291,8 @@ mod tests {
         assert_eq!(track.album.as_deref(), Some("Underdog"));
         assert_eq!(track.duration, 194);
         assert_eq!(track.date, Some(1795309125));
-        assert_eq!(track.album_art_url, None);
+        assert_eq!(track.album_art_url.as_deref(),
+            Some("https://coverartarchive.org/release/20f7f039-51b0-488a-8696-641a0a28fa14/front-500"));
         assert_eq!(track.user_playcount, 0);
         assert!(track.now_playing);
         assert_eq!(
