@@ -206,8 +206,10 @@ pub async fn fetch_recent_tracks(
         return Ok(tracks);
     }
 
+    // Default `listRecords` order is newest-first (reverse=true would give the
+    // oldest of the window), which is what the NP + recents shape needs.
     let plays_url = format!(
-        "{pds}/xrpc/com.atproto.repo.listRecords?repo={repo}&collection=fm.teal.feed.play&limit=3&reverse=true"
+        "{pds}/xrpc/com.atproto.repo.listRecords?repo={repo}&collection=fm.teal.feed.play&limit=3"
     );
     let json = match get_json(&plays_url).await {
         Ok(json) => json,
