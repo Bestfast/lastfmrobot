@@ -48,6 +48,57 @@ static IDENTITY_CACHE: LazyLock<Cache<String, (String, String)>> = LazyLock::new
         .build()
 });
 
+// release mbid -> release-group mbid. Releases know their group, plays don't,
+// and the canonical album art lives on the release group. Failed lookups are
+// deliberately not cached so a MusicBrainz blip retries on the next status.
+static RG_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(500)
+        .time_to_live(Duration::from_secs(24 * 60 * 60))
+        .build()
+});
+
+fn caa_release_group_url(rg_mbid: &str) -> String {
+    format!(
+        "https://coverartarchive.org/release-group/{rg_mbid}/front-{}",
+        crate::api_requester::CAA_SIZES[0]
+    )
+}
+
+async fn release_group_mbid(release_mbid: &str) -> Option<String> {
+    if let Some(hit) = RG_CACHE.get(release_mbid).await {
+        return Some(hit);
+    }
+    let url = format!(
+        "https://musicbrainz.org/ws/2/release/{release_mbid}?inc=release-groups&fmt=json"
+    );
+    let rg = match get_json(&url).await {
+        Ok(json) => json["release-group"]["id"].as_str().map(str::to_string),
+        Err(e) => {
+            log::warn!("teal: musicbrainz release lookup failed for {release_mbid}: {e}");
+            return None;
+        }
+    };
+    if let Some(rg) = rg.clone() {
+        RG_CACHE.insert(release_mbid.to_string(), rg).await;
+    }
+    rg
+}
+
+/// Fill in the release group and point the cover at its art. teal.fm tags the
+/// release, but the release group is the album: several pressings of one album
+/// carry different release-level art, while the group has the canonical cover.
+async fn enrich_release_group(track: &mut Track) {
+    let Some(release_mbid) = track.release_mbid.clone() else {
+        return;
+    };
+    let Some(rg) = release_group_mbid(&release_mbid).await else {
+        return;
+    };
+    track.album_art_url = Some(caa_release_group_url(&rg));
+    track.release_group_mbid = Some(rg);
+}
+
 pub fn user_for_uid(uid: u64) -> Option<&'static TealUser> {
     config::TEAL_USERS.iter().find(|u| u.uid == uid)
 }
@@ -186,6 +237,16 @@ pub async fn fetch_recent_tracks(
     handle: &str,
     actual_limit: usize,
 ) -> Result<Vec<Track>, BoxError> {
+    let mut tracks = fetch_plays(handle, actual_limit).await?;
+    // Only the first track ever feeds the cover render, so resolving its
+    // release group costs one extra (cached) MusicBrainz call, not four.
+    if let Some(first) = tracks.first_mut() {
+        enrich_release_group(first).await;
+    }
+    Ok(tracks)
+}
+
+async fn fetch_plays(handle: &str, actual_limit: usize) -> Result<Vec<Track>, BoxError> {
     // A DID is `did:plc:<base32>` - ':' is legal in a query value, no escaping.
     let (repo, pds) = identity(handle).await?;
 

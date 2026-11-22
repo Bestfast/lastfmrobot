@@ -454,28 +454,22 @@ fn format_tags(tags: Vec<String>, acceptable: &HashSet<String>) -> String {
         .join(" ")
 }
 
-/// Cover art chain for Koito-fed tracks: Navidrome > Koito > CAA (> Last.fm,
-/// which the caller tries next). Koito exposes no release-group mbid, so only
-/// the release mbid goes to Navidrome/CAA. The Koito image rides along as the
-/// `caa_url` slot of the Navidrome resolver — a Navidrome miss falls through
-/// to probing the Koito URL itself.
-async fn koito_cover_art(username: &str, track: &api_requester::Track) -> Option<String> {
-    let mut art = navidrome::resolve_cover_art_or_fallback(
-        username,
-        None,
-        track.release_mbid.as_deref(),
-        track.album_art_url.as_deref(),
-    )
-    .await;
-    if art.is_none()
-        && let Some(mbid) = track.release_mbid.as_deref()
+/// Cover art chain for teal.fm-fed tracks: the release group's canonical art
+/// from CAA first (the play is mbid-tagged, the group carries the album cover
+/// the artist published), then Navidrome's local copy of the album, then the
+/// release-level art the track already carries.
+async fn teal_cover_art(username: &str, track: &api_requester::Track) -> Option<String> {
+    if let Some(art) = api_requester::resolve_cover_art_url(track.album_art_url.as_deref()).await
     {
-        art = api_requester::resolve_cover_art_url(Some(
-            &api_requester::caa_front_url_largest(mbid),
-        ))
-        .await;
+        return Some(art);
     }
-    art
+    navidrome::resolve_cover_art_or_fallback(
+        username,
+        track.release_group_mbid.as_deref(),
+        track.release_mbid.as_deref(),
+        None,
+    )
+    .await
 }
 
 /// A Telegram file_id for the given cover. Inline media edits can't carry fresh
@@ -627,21 +621,27 @@ async fn status_command(
 
             if needs_cover {
                 let cover_start = std::time::Instant::now();
-                if koito && !is_teal {
-                    user_playcount = tracks[0].user_playcount;
-                    album_art_url =
-                        koito_cover_art(&user.account_username, &tracks[0]).await;
+                if is_teal {
+                    album_art_url = teal_cover_art(&user.account_username, &tracks[0]).await;
                 } else if user.api_type() == ApiType::Listenbrainz {
-                    // Resolve the cover and fetch the play count concurrently — both are
-                    // network calls, no reason to wait for them one after the other.
                     // Gated users resolve from Navidrome first (mbid -> local art),
-                    // falling back to CAA when Navidrome has no album.
-                    let resolve_fut = navidrome::resolve_cover_art_or_fallback(
-                        &user.account_username,
-                        tracks[0].release_group_mbid.as_deref(),
-                        tracks[0].release_mbid.as_deref(),
-                        tracks[0].album_art_url.as_deref(),
-                    );
+                    // falling back to CAA when Navidrome has no album. Koito's own
+                    // artwork is never trusted (its album mapping is unreliable), so
+                    // its image is not offered as the CAA fallback either.
+                    let resolve_fut = async {
+                        let caa_url = if koito {
+                            None
+                        } else {
+                            tracks[0].album_art_url.as_deref()
+                        };
+                        navidrome::resolve_cover_art_or_fallback(
+                            &user.account_username,
+                            tracks[0].release_group_mbid.as_deref(),
+                            tracks[0].release_mbid.as_deref(),
+                            caa_url,
+                        )
+                        .await
+                    };
                     // teal.fm has no play counts: they stay on the user's Koito.
                     let playcount_fut = async {
                         if is_teal {
@@ -651,6 +651,8 @@ async fn status_command(
                                     .unwrap_or_default(),
                                 None => 0,
                             }
+                        } else if koito {
+                            tracks[0].user_playcount
                         } else {
                             api_requester::fetch_listenbrainz_track_playcount(
                                 user.account_username.as_str(),
@@ -666,10 +668,12 @@ async fn status_command(
                     album_art_url = resolved;
                     user_playcount = playcount;
                 } else {
-                    album_art_url = api_requester::resolve_cover_art_url(
-                        tracks[0].album_art_url.as_deref(),
-                    )
-                    .await;
+                    let primary = if koito {
+                        None
+                    } else {
+                        tracks[0].album_art_url.as_deref()
+                    };
+                    album_art_url = api_requester::resolve_cover_art_url(primary).await;
                 }
                 log::debug!(
                     "status: cover resolve took {:?} (resolved={}, total {:?})",
@@ -677,7 +681,7 @@ async fn status_command(
                     album_art_url.is_some(),
                     started.elapsed()
                 );
-            } else if let Some(url) = tracks[0].album_art_url.clone() {
+            } else if tracks[0].album_art_url.is_some() {
                 // Warm the cache (resolved url + image bytes) off the critical path, so a
                 // later cover click can upload the bytes directly instead of waiting on
                 // Telegram to fetch the image from the CDN. When the primary url is a
@@ -685,16 +689,13 @@ async fn status_command(
                 // (and bytes) already cached. Inline text statuses warm too — the
                 // click mints its file_id from these bytes.
                 //
-                // Koito art is final (same precedence as the cover branch above), so
-                // only the bytes get warmed — no Navidrome/CAA probing, which also
-                // avoids Navidrome login noise when its creds are unset.
-                if koito {
+                // Koito's own image is never used as art, so its url is dropped here
+                // too - those users warm Navidrome/CAA instead.
+                if is_teal {
                     let account_username = user.account_username.clone();
                     let track = tracks[0].clone();
                     tokio::spawn(async move {
-                        if let Some(resolved) =
-                            koito_cover_art(&account_username, &track).await
-                        {
+                        if let Some(resolved) = teal_cover_art(&account_username, &track).await {
                             let _ = api_requester::cover_art_bytes(Some(&resolved)).await;
                         }
                     });
@@ -706,13 +707,18 @@ async fn status_command(
                     let album = tracks[0].album.clone();
                     let release_group_mbid = tracks[0].release_group_mbid.clone();
                     let release_mbid = tracks[0].release_mbid.clone();
+                    let primary = if koito {
+                        None
+                    } else {
+                        tracks[0].album_art_url.clone()
+                    };
                     tokio::spawn(async move {
                         let start = std::time::Instant::now();
                         let mut resolved = navidrome::resolve_cover_art_or_fallback(
                             &account_username,
                             release_group_mbid.as_deref(),
                             release_mbid.as_deref(),
-                            Some(&url),
+                            primary.as_deref(),
                         )
                         .await;
 
