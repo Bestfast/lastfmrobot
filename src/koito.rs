@@ -69,8 +69,19 @@ pub fn instance_for_uid(uid: u64) -> Option<&'static KoitoInstance> {
     config::KOITO_INSTANCES.iter().find(|i| i.uid == uid)
 }
 
-pub fn has_instance(uid: u64) -> bool {
-    instance_for_uid(uid).is_some()
+/// Koito as the now-playing/recents source (feature matrix: `source`).
+pub fn source_for_uid(uid: u64) -> Option<&'static KoitoInstance> {
+    instance_for_uid(uid).filter(|i| i.source)
+}
+
+/// Whether the user's play counts come from Koito (`playcount`).
+pub fn plays_for_uid(uid: u64) -> Option<&'static KoitoInstance> {
+    instance_for_uid(uid).filter(|i| i.playcount)
+}
+
+/// Whether the user's cover art comes from Koito (`cover_art`).
+pub fn covers_for_uid(uid: u64) -> bool {
+    instance_for_uid(uid).is_some_and(|i| i.cover_art)
 }
 
 async fn get_json(url: &str, inst: &KoitoInstance) -> Result<serde_json::Value, BoxError> {

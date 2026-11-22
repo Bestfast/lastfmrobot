@@ -1184,7 +1184,7 @@ pub async fn fetch_recent_tracks(
     };
 
     let koito_or_fallback = async {
-        match tg_user_id.and_then(koito::instance_for_uid) {
+        match tg_user_id.and_then(koito::source_for_uid) {
             Some(inst) => {
                 or_lastfm(
                     koito::fetch_recent_tracks(inst, actual_limit),

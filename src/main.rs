@@ -454,6 +454,30 @@ fn format_tags(tags: Vec<String>, acceptable: &HashSet<String>) -> String {
         .join(" ")
 }
 
+/// Cover art chain for Koito-fed tracks (feature matrix: `cover_art`):
+/// Navidrome > Koito > CAA (> Last.fm, which the caller tries next). Koito
+/// exposes no release-group mbid, so only the release mbid goes to
+/// Navidrome/CAA. The Koito image rides along as the `caa_url` slot of the
+/// Navidrome resolver - a Navidrome miss falls through to the Koito URL.
+async fn koito_cover_art(username: &str, track: &api_requester::Track) -> Option<String> {
+    let mut art = navidrome::resolve_cover_art_or_fallback(
+        username,
+        None,
+        track.release_mbid.as_deref(),
+        track.album_art_url.as_deref(),
+    )
+    .await;
+    if art.is_none()
+        && let Some(mbid) = track.release_mbid.as_deref()
+    {
+        art = api_requester::resolve_cover_art_url(Some(
+            &api_requester::caa_front_url_largest(mbid),
+        ))
+        .await;
+    }
+    art
+}
+
 /// Cover art chain for teal.fm-fed tracks: the release group's canonical art
 /// from CAA first (the play is mbid-tagged, the group carries the album cover
 /// the artist published), then Navidrome's local copy of the album, then the
@@ -596,9 +620,12 @@ async fn status_command(
             let mut album_art_url: Option<String> = None;
             let mut user_playcount = 0;
 
-            // Koito-mapped users already carry their cover + playcount on the
-            // track itself (see koito.rs) — no extra network calls needed.
-            let koito = koito::has_instance(user.tg_user_id);
+            // Koito is a per-user feature matrix (config::KoitoInstance): it can
+            // feed the now-playing/recents source, the cover art and/or the play
+            // counts, independently.
+            let koito_src = koito::source_for_uid(user.tg_user_id);
+            let koito_art = koito::covers_for_uid(user.tg_user_id);
+            let koito_plays = koito::plays_for_uid(user.tg_user_id);
             // teal.fm-mapped users take the track (exact album + mbids) from
             // teal.fm, so covers stay on the Navidrome/CAA chain and the play
             // count is asked to Koito separately instead of riding the track.
@@ -607,7 +634,7 @@ async fn status_command(
             // What actually fed this status — reported by the ℹ️ button.
             let mut plays_src = if is_teal {
                 't'
-            } else if koito {
+            } else if koito_src.is_some() {
                 'k'
             } else {
                 match user.api_type() {
@@ -623,13 +650,15 @@ async fn status_command(
                 let cover_start = std::time::Instant::now();
                 if is_teal {
                     album_art_url = teal_cover_art(&user.account_username, &tracks[0]).await;
+                } else if koito_art {
+                    album_art_url =
+                        koito_cover_art(&user.account_username, &tracks[0]).await;
                 } else if user.api_type() == ApiType::Listenbrainz {
                     // Gated users resolve from Navidrome first (mbid -> local art),
-                    // falling back to CAA when Navidrome has no album. Koito's own
-                    // artwork is never trusted (its album mapping is unreliable), so
-                    // its image is not offered as the CAA fallback either.
+                    // falling back to CAA when Navidrome has no album. A Koito-fed
+                    // track's own image is not offered as the CAA fallback.
                     let resolve_fut = async {
-                        let caa_url = if koito {
+                        let caa_url = if koito_src.is_some() {
                             None
                         } else {
                             tracks[0].album_art_url.as_deref()
@@ -642,33 +671,31 @@ async fn status_command(
                         )
                         .await
                     };
-                    // teal.fm has no play counts: they stay on the user's Koito.
+                    // Play counts come from Koito when the user's matrix says so
+                    // (teal.fm carries none at all).
                     let playcount_fut = async {
-                        if is_teal {
-                            match koito::instance_for_uid(user.tg_user_id) {
-                                Some(inst) => koito::playcount_for(inst, &tracks[0])
+                        match koito_plays {
+                            Some(inst) if koito_src.is_none() => {
+                                koito::playcount_for(inst, &tracks[0])
                                     .await
-                                    .unwrap_or_default(),
-                                None => 0,
+                                    .unwrap_or_default()
                             }
-                        } else if koito {
-                            tracks[0].user_playcount
-                        } else {
-                            api_requester::fetch_listenbrainz_track_playcount(
+                            Some(_) => tracks[0].user_playcount,
+                            None => api_requester::fetch_listenbrainz_track_playcount(
                                 user.account_username.as_str(),
                                 tracks[0].artist.as_str(),
                                 tracks[0].name.as_str(),
                                 tracks[0].recording_mbid.as_deref(),
                             )
                             .await
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
                         }
                     };
                     let (resolved, playcount) = tokio::join!(resolve_fut, playcount_fut);
                     album_art_url = resolved;
                     user_playcount = playcount;
                 } else {
-                    let primary = if koito {
+                    let primary = if koito_src.is_some() {
                         None
                     } else {
                         tracks[0].album_art_url.as_deref()
@@ -689,13 +716,23 @@ async fn status_command(
                 // (and bytes) already cached. Inline text statuses warm too — the
                 // click mints its file_id from these bytes.
                 //
-                // Koito's own image is never used as art, so its url is dropped here
-                // too - those users warm Navidrome/CAA instead.
+                // A Koito-fed track's own image is only used as art when the
+                // user's matrix enables it; otherwise warm Navidrome/CAA instead.
                 if is_teal {
                     let account_username = user.account_username.clone();
                     let track = tracks[0].clone();
                     tokio::spawn(async move {
                         if let Some(resolved) = teal_cover_art(&account_username, &track).await {
+                            let _ = api_requester::cover_art_bytes(Some(&resolved)).await;
+                        }
+                    });
+                } else if koito_art {
+                    let account_username = user.account_username.clone();
+                    let track = tracks[0].clone();
+                    tokio::spawn(async move {
+                        if let Some(resolved) =
+                            koito_cover_art(&account_username, &track).await
+                        {
                             let _ = api_requester::cover_art_bytes(Some(&resolved)).await;
                         }
                     });
@@ -707,7 +744,7 @@ async fn status_command(
                     let album = tracks[0].album.clone();
                     let release_group_mbid = tracks[0].release_group_mbid.clone();
                     let release_mbid = tracks[0].release_mbid.clone();
-                    let primary = if koito {
+                    let primary = if koito_src.is_some() {
                         None
                     } else {
                         tracks[0].album_art_url.clone()
@@ -747,23 +784,28 @@ async fn status_command(
 
             let mut tags_text: String = "".to_string();
 
-            if is_teal {
-                if let Some(inst) = koito::instance_for_uid(user.tg_user_id) {
-                    user_playcount = koito::playcount_for(inst, &tracks[0])
+            // Only when the cover branch above did not already resolve it, so a
+            // Koito play-count lookup never runs twice per status.
+            if !needs_cover {
+                match koito_plays {
+                    Some(inst) if koito_src.is_none() => {
+                        user_playcount = koito::playcount_for(inst, &tracks[0])
+                            .await
+                            .unwrap_or_default();
+                    }
+                    Some(_) => user_playcount = tracks[0].user_playcount,
+                    None if user.api_type() == ApiType::Listenbrainz => {
+                        user_playcount = api_requester::fetch_listenbrainz_track_playcount(
+                            user.account_username.as_str(),
+                            tracks[0].artist.as_str(),
+                            tracks[0].name.as_str(),
+                            tracks[0].recording_mbid.as_deref(),
+                        )
                         .await
                         .unwrap_or_default();
+                    }
+                    None => {}
                 }
-            } else if koito {
-                user_playcount = tracks[0].user_playcount;
-            } else if user.api_type() == ApiType::Listenbrainz && !needs_cover {
-                user_playcount = api_requester::fetch_listenbrainz_track_playcount(
-                    user.account_username.as_str(),
-                    tracks[0].artist.as_str(),
-                    tracks[0].name.as_str(),
-                    tracks[0].recording_mbid.as_deref(),
-                )
-                .await
-                .unwrap_or_default();
             }
 
             // Tags, fastest source first: Navidrome file tags by recording mbid
