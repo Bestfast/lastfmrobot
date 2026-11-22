@@ -1088,7 +1088,7 @@ async fn fetch_recent_tracks_listenbrainz(
     let base_url = get_base_url(&ApiType::Listenbrainz);
 
     let url = format!("{base_url}user/{username}/playing-now");
-    let response = CLIENT
+    let response = CLIENT_LB
         .get(&url)
         .header("cache-control", cache_control)
         .send()
@@ -1103,7 +1103,7 @@ async fn fetch_recent_tracks_listenbrainz(
     }
 
     let url = format!("{base_url}user/{username}/listens?count=3");
-    let response = CLIENT
+    let response = CLIENT_LB
         .get(&url)
         .header("cache-control", cache_control)
         .send()
